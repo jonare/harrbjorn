@@ -1,0 +1,25 @@
+# Default allowlist for the sbx forward proxy (one entry per line, '#' comments).
+# Format: host (ports 80+443), host:port, *.domain (wildcard), IP[:port] literal.
+
+# --- Claude Code (LLM API + CLI infrastructure) ---
+api.anthropic.com
+claude.ai
+claude.com
+platform.claude.com
+downloads.claude.ai
+code.claude.com
+registry.npmjs.org
+
+# --- Dev tooling / package managers ---
+deb.debian.org
+security.debian.org
+pypi.org
+files.pythonhosted.org
+github.com
+api.github.com
+codeload.github.com
+raw.githubusercontent.com
+
+# --- Host services (bridge gateway 172.28.0.1; needs matching SBX_HOST_PORTS) ---
+# Local OpenAI-compatible model server on the host:
+172.28.0.1:8000
