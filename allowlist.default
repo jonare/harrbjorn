@@ -20,6 +20,6 @@ api.github.com
 codeload.github.com
 raw.githubusercontent.com
 
-# --- Host services (bridge gateway 172.28.0.1; needs matching SBX_HOST_PORTS) ---
-# Local OpenAI-compatible model server on the host:
-172.28.0.1:8000
+# --- Host services (bridge gateway 172.28.0.1) ---
+# The local model server entry (172.28.0.1:<port>) is added automatically by
+# run-sandbox.sh, derived from the model config's ANTHROPIC_BASE_URL.

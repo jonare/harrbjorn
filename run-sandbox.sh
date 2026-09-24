@@ -5,6 +5,9 @@
 #   ./run-sandbox.sh -w <workdir> [-a host[:port]]... [-f extra-allowlist] \
 #                    [--no-host-isolation] [--rebuild] -- <cmd> [args...]
 #
+#   Model config: the host Claude setup (SBX_CLAUDE_CONFIG, default
+#   ~/claude.sh) is injected as env vars; loopback -> 172.28.0.1 (host gw).
+#
 # Examples:
 #   ./run-sandbox.sh -w ~/proj -- claude --dangerously-skip-permissions
 #   ./run-sandbox.sh -w ~/proj -a 192.168.50.10:22 -- claude -p "..."
@@ -24,16 +27,17 @@ WORKDIR=""
 EXTRA_HOSTS=()
 EXTRA_ALLOWLIST=""
 HOST_ISOLATION=1
+HOST_ISOLATION_SET=0
 REBUILD=0
 
-usage() { sed -n '2,16p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,19p' "$0"; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -w) WORKDIR="$2"; shift 2 ;;
     -a) EXTRA_HOSTS+=("$2"); shift 2 ;;
     -f) EXTRA_ALLOWLIST="$2"; shift 2 ;;
-    --no-host-isolation) HOST_ISOLATION=0; shift ;;
+    --no-host-isolation) HOST_ISOLATION=0; HOST_ISOLATION_SET=1; shift ;;
     --rebuild) REBUILD=1; shift ;;
     -h|--help) usage 0 ;;
     --) shift; break ;;
@@ -50,14 +54,58 @@ WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
   set -a; source "$SCRIPT_DIR/.env"; set +a
 fi
-HOST_ISOLATION="${HOST_ISOLATION:-1}"
+# .env is sourced above and may set HOST_ISOLATION=1; an explicit
+# --no-host-isolation flag always wins.
+if [[ "$HOST_ISOLATION_SET" -eq 1 ]]; then
+  HOST_ISOLATION=0
+else
+  HOST_ISOLATION="${HOST_ISOLATION:-1}"
+fi
 SBX_MEMORY="${SBX_MEMORY:-4g}"
 SBX_CPUS="${SBX_CPUS:-2}"
 SBX_PIDS="${SBX_PIDS:-1024}"
+# ----------------------------------------------- model config (injection)
+# The sandbox reuses the host's Claude Code model setup (SBX_CLAUDE_CONFIG,
+# default ~/claude.sh) — same model, effort, context window and key — with
+# one rewrite: a loopback ANTHROPIC_BASE_URL is pointed at the host through
+# the bridge gateway (172.28.0.1) instead of localhost. Only `export ...`
+# lines are evaluated, so the file's comments and trailing `claude ...`
+# invocation are ignored. The result is injected as env vars, standalone;
+# no file is mounted into the container.
+SBX_CLAUDE_CONFIG="${SBX_CLAUDE_CONFIG:-$HOME/claude.sh}"
+CONFIG_ENV=()
+CFG_GATEWAY_ENTRY=""
+if [[ -f "$SBX_CLAUDE_CONFIG" ]]; then
+  cfg_exports="$(grep -E '^export[[:space:]]' "$SBX_CLAUDE_CONFIG" || true)"
+  cfg_env="$(
+    env -i sh -c '
+      eval "$1"
+      case "${ANTHROPIC_BASE_URL:-}" in
+        http://localhost:*)   ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL/localhost/172.28.0.1} ;;
+        http://127.0.0.1:*)   ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL/127.0.0.1/172.28.0.1} ;;
+      esac
+      export ANTHROPIC_BASE_URL
+      env' sh "$cfg_exports"
+  )"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && CONFIG_ENV+=(-e "$line")
+  done <<< "$cfg_env"
+  cfg_url="$(printf '%s\n' "$cfg_env" | sed -n 's/^ANTHROPIC_BASE_URL=//p')"
+  cfg_rest="${cfg_url#*://}"
+  cfg_rest="${cfg_rest%/}"
+  cfg_port="${cfg_rest##*:}"
+  if [[ "$cfg_rest" == *:* && "$cfg_port" =~ ^[0-9]+$ ]]; then
+    SBX_HOST_PORTS="${SBX_HOST_PORTS:-$cfg_port}"
+    CFG_GATEWAY_ENTRY="172.28.0.1:$cfg_port"
+  fi
+  echo ">> model config: $SBX_CLAUDE_CONFIG (base_url=${cfg_url:-n/a})"
+else
+  echo "warn: no model config at $SBX_CLAUDE_CONFIG; falling back to ANTHROPIC_API_KEY in .env." >&2
+  CONFIG_ENV=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env, or provide a model config via SBX_CLAUDE_CONFIG}")
+fi
 # Comma-separated tcp ports on the host gateway (172.28.0.1) the sandbox may
-# reach, e.g. a local OpenAI-compatible model server. Pair each with an
-# allowlist entry (172.28.0.1:<port>) via -a/-f or allowlist.default.
-SBX_HOST_PORTS="${SBX_HOST_PORTS:-8000}"
+# reach. Defaults to the port parsed from the model config's base URL above.
+SBX_HOST_PORTS="${SBX_HOST_PORTS:-}"
 
 # ------------------------------------------------------------- docker
 DOCKER=docker
@@ -102,6 +150,8 @@ MERGED="$STATE_DIR/allowlist.txt"
   if [[ -n "$EXTRA_ALLOWLIST" ]]; then
     grep -vE '^\s*(#|$)' "$EXTRA_ALLOWLIST" || true
   fi
+  # Host model server, derived from the model config's base URL.
+  if [[ -n "$CFG_GATEWAY_ENTRY" ]]; then echo "$CFG_GATEWAY_ENTRY"; fi
 } | sort -u > "$MERGED"
 # Hash only the content lines — the header comment carries a run timestamp.
 HASH="$(grep -vE '^\s*#' "$MERGED" | sha256sum | awk '{print $1}')"
@@ -184,30 +234,51 @@ if [[ "$HOST_ISOLATION" == "1" ]]; then
   fi
 fi
 
-# -------------------------------------------------------- model backend
-# Two backends, chosen via .env (see .env.example):
-#   vllm (default here): ANTHROPIC_BASE_URL -> the host model server via the
-#     bridge gateway; needs SBX_HOST_PORTS + allowlist entry 172.28.0.1:<port>.
-#   anthropic: a real ANTHROPIC_API_KEY, traffic via the allowlisted API hosts.
-MODEL_ENV=()
-if [[ -n "${SBX_MODEL_BASE_URL:-}" ]]; then
-  M="${SBX_MODEL_NAME:-qwen}"
-  MODEL_ENV=(
-    -e "CLAUDE_CODE_EFFORT_LEVEL=${SBX_EFFORT_LEVEL:-medium}"
-    -e "ANTHROPIC_BASE_URL=${SBX_MODEL_BASE_URL}"
-    -e "ANTHROPIC_API_KEY=${SBX_MODEL_API_KEY:-vllm}"
-    -e "ANTHROPIC_MODEL=${M}"
-    -e "CLAUDE_CODE_SUBAGENT_MODEL=${M}"
-    -e "ANTHROPIC_SMALL_FAST_MODEL=${M}"
-    -e "ANTHROPIC_DEFAULT_MODEL=${M}"
-    -e "ANTHROPIC_DEFAULT_SONNET_MODEL=${M}"
-    -e "ANTHROPIC_DEFAULT_HAIKU_MODEL=${M}"
-    -e "CLAUDE_CODE_MAX_CONTEXT_TOKENS=${SBX_MAX_CONTEXT_TOKENS:-100000}"
-    -e "CLAUDE_CODE_MAX_OUTPUT_TOKENS=${SBX_MAX_OUTPUT_TOKENS:-8192}"
-    -e "CLAUDE_CODE_AUTO_COMPACT_WINDOW=${SBX_AUTO_COMPACT_WINDOW:-95000}"
-  )
+# --------------------------------------------- persistent agent HOME
+# Claude Code keeps its onboarding/settings state in HOME (~/.claude.json and
+# ~/.claude/). Persist it on the host so state survives between runs; the
+# rest of the container filesystem stays read-only.
+AGENT_HOME="$STATE_DIR/agent-home"
+mkdir -p "$AGENT_HOME"
+chown 1000:1000 "$AGENT_HOME"
+chmod 0700 "$AGENT_HOME"
+
+# Pre-seed Claude Code's interactive state so the first-run wizard (theme ->
+# login/API-key) and the /work trust dialog are skipped entirely. The custom
+# API key from the model config is added to the approved list (the wizard
+# would otherwise validate it against the real Anthropic API and reject it).
+# Existing state is merged, never replaced.
+CFG_API_KEY=""
+for kv in "${CONFIG_ENV[@]}"; do
+  case "$kv" in ANTHROPIC_API_KEY=*) CFG_API_KEY="${kv#ANTHROPIC_API_KEY=}" ;; esac
+done
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$AGENT_HOME" "$CFG_API_KEY" <<'PYEOF' \
+    || { echo "warn: failed to pre-seed agent HOME; first-run wizard will appear." >&2; }
+import json, os, sys
+home, key = sys.argv[1], sys.argv[2]
+cj = os.path.join(home, ".claude.json")
+try:
+    with open(cj) as f: d = json.load(f)
+except (FileNotFoundError, ValueError):
+    d = {}
+d["hasCompletedOnboarding"] = True
+apk = d.setdefault("customApiKeyResponses", {"approved": [], "rejected": []})
+approved = apk.setdefault("approved", [])
+if key and key not in approved:
+    approved.append(key)
+d.setdefault("projects", {}).setdefault("/work", {})["hasTrustDialogAccepted"] = True
+tmp = cj + ".tmp"
+with open(tmp, "w") as f: json.dump(d, f, indent=2)
+os.replace(tmp, cj)
+os.chmod(cj, 0o600)
+ss = os.path.join(home, ".claude", "settings.json")
+if not os.path.exists(ss):
+    os.makedirs(os.path.dirname(ss), exist_ok=True)
+    with open(ss, "w") as f: json.dump({"theme": "dark"}, f)
+PYEOF
 else
-  MODEL_ENV=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env, or use the vllm backend (SBX_MODEL_BASE_URL)}")
+  echo "warn: python3 not found; agent HOME not pre-seeded, first-run wizard will appear." >&2
 fi
 
 # ------------------------------------------------------------- sandbox
@@ -219,8 +290,8 @@ echo ">> sandbox: workdir=$WORKDIR_ABS cmd=${CMD[*]}"
 $DOCKER run --rm $T --name "sbx-$(date +%s)" \
   --network sbx-internal \
   --user 1000:1000 \
-  -v "$WORKDIR_ABS:/work:z" -w /work \
-  "${MODEL_ENV[@]}" \
+  -v "$WORKDIR_ABS:/work:z" -v "$AGENT_HOME:/home/agent:z" -w /work \
+  "${CONFIG_ENV[@]}" \
   -e HOME=/home/agent \
   -e HTTP_PROXY=http://sbx-proxy:3128 -e http_proxy=http://sbx-proxy:3128 \
   -e HTTPS_PROXY=http://sbx-proxy:3128 -e https_proxy=http://sbx-proxy:3128 \
@@ -229,7 +300,6 @@ $DOCKER run --rm $T --name "sbx-$(date +%s)" \
   --read-only \
   --tmpfs /tmp:uid=1000,gid=1000,size=1g,mode=1777 \
   --tmpfs /var/tmp:uid=1000,gid=1000,size=256m,mode=1777 \
-  --tmpfs /home/agent:uid=1000,gid=1000,size=2g,mode=0700 \
   --cap-drop ALL --security-opt no-new-privileges:true \
   --pids-limit "$SBX_PIDS" --memory "$SBX_MEMORY" --cpus "$SBX_CPUS" \
   --ulimit nofile=65536:65536 \

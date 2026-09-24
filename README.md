@@ -8,22 +8,31 @@ kjøre autonomt mot en bind-mounted workspace, uten å kunne skade hostsystemet.
 Den innsperrede agenten skal:
 
 - **kun** skrive i den spesifiserte workspace-direktivet (rw-bindmount til `/work`)
+  og sin egen agent-HOME (persistert under `.sandbox/agent-home`)
 - **kun** ha nettverksutgang til en konfigurerbar host-whitelist over http(s)
   (fungerer også for sikkerhetstesting mot whitelistede mål, inkl. IP-literaler)
 - **ikke** nå hosten eller internettet utover whitelisten
 - **ikke** kunne skade hosten via filsystemet (read-only rootfs, unprivilegert bruker)
 
-Model-backend (velg én i `.env`, se `.env.example`):
+Model-backend:
 
-- **vllm på hosten** (standard her): `SBX_MODEL_BASE_URL=http://172.28.0.1:8000/`
-  + `SBX_MODEL_NAME=qwen` peker Claude Code mot den OpenAI-kompatible
-  modellen via bridge-gatewayen — samme oppsett som `~/claude.sh`, men mot
-  gateway-IP i stedet for `localhost`. Krever `SBX_HOST_PORTS=8000` og
-  allowlist-entry `172.28.0.1:8000` (begge i standardsettet).
-  `SBX_EFFORT_LEVEL=medium` settes til `CLAUDE_CODE_EFFORT_LEVEL` — vllm
-  godtar kun `xhigh`/`medium`/`low` (ikke `high`).
-- **Sant Anthropic API**: komment vllm-linjene ut og sett
-  `ANTHROPIC_API_KEY=sk-ant-...`; trafikken går via de allowlistede API-hosts.
+Sandboxen rebruker **hostens egen Claude Code-modelconfig**
+(`SBX_CLAUDE_CONFIG`, standard `~/claude.sh`) som kilde til
+`ANTHROPIC_*`/`CLAUDE_CODE_*`-env-vars — samme modell, effort, kontekstvindu
+og nøkkel som på hosten. Den eneste endringen er at en loopback-
+`ANTHROPIC_BASE_URL` (`localhost`/`127.0.0.1`) skrives om til
+bridge-gatewayen `172.28.0.1`, slik at containeren når hostens modellserver
+via det riktige grensesnittet. Configen injiseres som env-vars i containeren
+(standalone) — ingen fil monteres inn. Kun `export ...`-linjene leses, så
+filens kommentarer og avsluttende `claude`-kommando ignoreres.
+
+Porten i base-URL-en parsest ut og legges automatisk til i
+`SBX_HOST_PORTS` (iptables) og allowlisten (`172.28.0.1:<port>`), så bytter
+du port på hosten trenger bare config-fila å oppdateres.
+
+- **Sant Anthropic API**: endre hostconfigen (eller peke `SBX_CLAUDE_CONFIG`
+  et annet sted / fjerne den og sette `ANTHROPIC_API_KEY` i `.env`);
+  trafikken går via de allowlistede API-hosts.
 
 Merk: model-nøkkel/base-URL er lesbare fra innsiden av sandboxen (det er et
 krav, ikke et hull) — hold ikke noe annet hemmelig i workspace-direktivet.
@@ -50,14 +59,17 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
    containeren. Kun rettet mot sandbox-bridgen. Enkelte tcp-porter på hosten
    kan slippes gjennom med `SBX_HOST_PORTS` (se [Host-tjenester](#host-tjenester)).
 4. **Container-hardening** — `--read-only`, `--cap-drop ALL`,
-   `--security-opt no-new-privileges`, uid 1000, tmpfs over /tmp /var/tmp
-   /home/agent, pids/memory/cpu-limit.
+   `--security-opt no-new-privileges`, uid 1000, tmpfs over /tmp og /var/tmp,
+   persistent agent-HOME (`.sandbox/agent-home` — Claude Code sitt
+   onboarding/settings-state, pre-seedet ved hver kjør: onboarding fullført,
+   `/work`-trust-dialog acceptert, modelconfigens API-key approvet — så
+   first-run-vizarden hoppes over helt), pids/memory/cpu-limit.
 
 ## Setup
 
 ```bash
 sudo systemctl enable --now docker          # første gang
-cp .env.example .env                        # fyll inn ANTHROPIC_API_KEY
+cp .env.example .env                        # valgfrie limit/overrides
 ```
 
 Alt annet (bilder, nettverk, proxy, iptables) settes opp automatisk av
@@ -129,16 +141,19 @@ avvises alltid — også for IP-literal-oppføringer.
 ## Host-tjenester
 
 Sandboxen kan nå spesifikke tjenester på selve hosten (her: OpenAI-kompatibel
-modellserver på port 8000). To lag må begge slippe gjennom:
+modellserver, port parsest fra modelconfigens base URL). To lag må begge
+slippe gjennom:
 
-1. **iptables** (host-bridgen): `SBX_HOST_PORTS=8000` i `.env` (eller
-   `SBX_HOST_PORTS=8000,11434 …` for flere) legger til ACCEPT-regel for
-   `tcp/<port>` i isolasjonskjeden, før DROP.
-2. **Allowlist**: `172.28.0.1:8000` (bridge-gateway = hosten) ligger i
-   `allowlist.default`; proxyen aksepterer IP-literaler kun dersom de er
-   eksplisitt tillatt. Hostname-oppføringer kan aldri reserveres til
-   172.28.0.0/24 (DNS-rebinding-vern), så kun den eksplicitte IP-inngangen
-   når hosten.
+1. **iptables** (host-bridgen): `SBX_HOST_PORTS` legger til ACCEPT-regel for
+   hver `tcp/<port>` i isolasjonskjeden, før DROP. Modellserver-porten legges
+   til automatisk; andre tjenester legges til i `.env` (f.eks.
+   `SBX_HOST_PORTS=8000,11434`).
+2. **Allowlist**: `172.28.0.1:<port>` (bridge-gateway = hosten) legges
+   automatisk til for modellserveren; andre host-tjenester må påsies med
+   `-a 172.28.0.1:<port>` eller `-f`. Proxyen aksepterer IP-literaler kun
+   dersom de er eksplisitt tillatt. Hostname-oppføringer kan aldri
+   reserveres til 172.28.0.0/24 (DNS-rebinding-vern), så kun den
+   eksplicitte IP-inngangen når hosten.
 
 Merk: services på hosten må lytte på et grensesnitt utover loopback
 (f.eks. `0.0.0.0` eller LAN-IP), ikke bare `127.0.0.1`.
@@ -208,6 +223,7 @@ claude -p --dangerously-skip-permissions "Svar bare: OK"   # agent kjører via p
   bygg på nytt med `--rebuild` for oppdateringer.
 - Fast uid/gid 1000 samsvarer med denne hosten. Bindmounter fra andre
   uids: juster `--user` og tmpfs-`uid=`/`gid=` i `run-sandbox.sh`.
-- `.sandbox/` og `.env` er git-ignoreret (allowlist-sammensmeltning + nøkkel).
+- `.sandbox/` og `.env` er git-ignoreret (allowlist-sammensmeltning +
+  agent-HOME + nøkkel).
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter.
