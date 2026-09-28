@@ -138,6 +138,15 @@ def _port_allowed(ports, port):
     return port in ports
 
 
+def _merge_ports(existing, new):
+    """Union of two entry port sets; an empty set means 'default ports 80/443'."""
+    if not existing:
+        existing = frozenset((80, 443))
+    if not new:
+        new = frozenset((80, 443))
+    return existing | new
+
+
 def load_allowlist(path):
     hosts, wildcards, ipnets = {}, {}, []
     with open(path, "r", encoding="utf-8") as fh:
@@ -158,7 +167,15 @@ def load_allowlist(path):
             try:
                 if IPV4_RE.match(line) or line.count(":") >= 2:
                     ip = ipaddress.ip_address(line)
-                    ipnets.append((ipaddress.ip_network(str(ip)), entry_ports))
+                    net = ipaddress.ip_network(str(ip))
+                    for i, (existing, ports) in enumerate(ipnets):
+                        if existing == net:
+                            # allowed() returns on the first matching net, so
+                            # duplicate nets must carry the merged port set.
+                            ipnets[i] = (existing, _merge_ports(ports, entry_ports))
+                            break
+                    else:
+                        ipnets.append((net, entry_ports))
                     continue
             except ValueError:
                 pass
@@ -167,7 +184,11 @@ def load_allowlist(path):
                 if not HOST_RE.match(line[1:]):
                     log.warning("allowlist line %d: bad entry %r, skipping", lineno, raw)
                     continue
-                wildcards[line] = entry_ports
+                key = line[1:]  # '.foo.com' — matched via name.endswith(key)
+                if key in wildcards:
+                    wildcards[key] = _merge_ports(wildcards[key], entry_ports)
+                else:
+                    wildcards[key] = entry_ports
             elif line == "*":
                 log.warning(
                     "allowlist line %d: bare '*' wildcard disabled (use *.domain)",
@@ -175,7 +196,10 @@ def load_allowlist(path):
                 )
                 continue
             elif HOST_RE.match(line):
-                hosts[line] = entry_ports
+                if line in hosts:
+                    hosts[line] = _merge_ports(hosts[line], entry_ports)
+                else:
+                    hosts[line] = entry_ports
             else:
                 log.warning("allowlist line %d: bad entry %r, skipping", lineno, raw)
     return Allowlist(hosts, wildcards, ipnets)
@@ -190,7 +214,7 @@ def resolve_checked(name, port):
     try:
         infos = socket.getaddrinfo(name, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
-        raise RefusedError(f"DNS resolution failed for {name!r}: {e}")
+        raise ConnectionRefusedError(f"DNS resolution failed for {name!r}: {e}")
     addrs = []
     for family, _type, _proto, _canon, sockaddr in infos:
         ip = ipaddress.ip_address(sockaddr[0])
@@ -200,7 +224,7 @@ def resolve_checked(name, port):
             )
         addrs.append((family, sockaddr))
     if not addrs:
-        raise RefusedError(f"no addresses for {name!r}")
+        raise ConnectionRefusedError(f"no addresses for {name!r}")
     return addrs
 
 
@@ -308,7 +332,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except PermissionError as e:
             deny(self, "CONNECT", target, str(e))
             return
-        except (OSError, RefusedError) as e:
+        except (OSError, ConnectionRefusedError) as e:
             log.warning(
                 "client=%s method=CONNECT target=%s action=ERROR reason=%s",
                 self.client_address[0], target, e,
@@ -362,7 +386,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except PermissionError as e:
             deny(self, self.command, target, str(e))
             return
-        except (OSError, RefusedError) as e:
+        except (OSError, ConnectionRefusedError) as e:
             log.warning(
                 "client=%s method=%s target=%s action=ERROR reason=%s",
                 self.client_address[0], self.command, target, e,
