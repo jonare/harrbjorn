@@ -1,0 +1,32 @@
+# harrbjorn host-isolation — sudoers-drop-in (kun SBX-ISOLATE-kjeden).
+#
+# Installer en gang med (se README 'Host-isolasjon'):
+#   sed "s/#USER#/$(id -un)/" etc/harrbjorn-sbx.sudoers \
+#     | sudo tee /etc/sudoers.d/harrbjorn-sbx >/dev/null
+#   sudo chmod 0440 /etc/sudoers.d/harrbjorn-sbx
+#   sudo visudo -cf /etc/sudoers.d/harrbjorn-sbx   # validerer syntaks
+# Fjern med:  sudo rm /etc/sudoers.d/harrbjorn-sbx
+#
+# Må installeres som /etc/sudoers.d/harrbjorn-sbx — ingen prikk i navnet,
+# ellers ignorerer sudo filen.
+#
+# Kun SBX-ISOLATE-kjeden, kun haket til sandbox-bridgen (br-*): wrapperen
+# (lib/sandbox.sh) re-appliserer reglene ved hver kjør, så dette er alt
+# som trengs for at host-isolasjonslaget (3) slår automatisk inn.
+# `--dport *` tillater kun NEW-tcp ACCEPT i SBX-ISOLATE — samme retning som
+# SBX_HOST_PORTS. Hvis iptables bor andre stede (f.eks. /usr/sbin/iptables),
+# juster pathen.
+
+Cmnd_Alias HARRBJORN_SBX = \
+    /usr/bin/iptables --version, \
+    /usr/bin/iptables -N SBX-ISOLATE, \
+    /usr/bin/iptables -F SBX-ISOLATE, \
+    /usr/bin/iptables -X SBX-ISOLATE, \
+    /usr/bin/iptables -A SBX-ISOLATE -m conntrack --ctstate ESTABLISHED\,RELATED -j ACCEPT, \
+    /usr/bin/iptables -A SBX-ISOLATE -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT, \
+    /usr/bin/iptables -A SBX-ISOLATE -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT, \
+    /usr/bin/iptables -A SBX-ISOLATE -p tcp --dport * -m conntrack --ctstate NEW -j ACCEPT, \
+    /usr/bin/iptables -A SBX-ISOLATE -j DROP, \
+    /usr/bin/iptables -D INPUT -i br-* -j SBX-ISOLATE, \
+    /usr/bin/iptables -I INPUT 1 -i br-* -j SBX-ISOLATE
+#USER# ALL=(root) NOPASSWD: HARRBJORN_SBX

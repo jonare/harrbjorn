@@ -203,7 +203,8 @@ sbx_main() {
       echo "warn: could not find bridge for sbx-internal; skipping host-isolation iptables." >&2
     elif ! sudo -n iptables --version >/dev/null 2>&1; then
       echo "warn: sudo (passwordless) unavailable; host-isolation iptables NOT installed." >&2
-      echo "      install with (see README 'Fjerne iptables' for removal), ports from SBX_HOST_PORTS:" >&2
+      echo "      install the sudoers drop-in once (etc/harrbjorn-sbx.sudoers; README 'Host-isolasjon')," >&2
+      echo "      or install manually, ports from SBX_HOST_PORTS:" >&2
       echo "      sudo iptables -N SBX-ISOLATE 2>/dev/null || true" >&2
       echo "      sudo iptables -A SBX-ISOLATE -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" >&2
       echo "      sudo iptables -A SBX-ISOLATE -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT" >&2

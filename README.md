@@ -205,7 +205,7 @@ python3 -c "import socket; socket.create_connection(('172.28.0.1', 5432), 5)"
 
 På som standard (skipp: `--no-host-isolation` eller `HOST_ISOLATION=0` i `.env`).
 Påvirker kun INPUT-kjeden for sandbox-bridgen; proxy-egress-nettverket
-(172.29.0.0/24) er berørt. Reglene (idempotent, ledd `SBX-ISOLATE`):
+(172.29.0.0/24) er ikke berørt. Reglene (idempotent, ledd `SBX-ISOLATE`):
 
 ```
 -i br-<sbx-internal> :
@@ -217,6 +217,24 @@ Påvirker kun INPUT-kjeden for sandbox-bridgen; proxy-egress-nettverket
 
 Kjeden rebuildes fra bunnen ved hver kjør, så portsettet følger alltid
 `SBX_HOST_PORTS`.
+
+### Automatisk installasjon (sudoers-drop-in)
+
+På hosts uten passordfritt sudo gir `etc/harrbjorn-sbx.sudoers` wrapperen
+NOPASSWD-tilgang til akkurat de iptables-kommandoen wrapperen selv kjører
+(kun SBX-ISOLATE-kjeden, kun mot sandbox-bridgen) — så laget installerer
+automatisk ved hver kjør:
+
+```bash
+sed "s/#USER#/$(id -un)/" etc/harrbjorn-sbx.sudoers \
+  | sudo tee /etc/sudoers.d/harrbjorn-sbx >/dev/null
+sudo chmod 0440 /etc/sudoers.d/harrbjorn-sbx
+sudo visudo -cf /etc/sudoers.d/harrbjorn-sbx     # må si "parsed OK"
+```
+
+Filen må ligge uten prikk i navnet, ellers ignorerer sudo den. Sjekk
+`command -v iptables` først — hvis den bor andre stede enn
+`/usr/bin/iptables`, juster pathen i drop-in-fila før install.
 
 ## Self-test (end-til-end)
 
@@ -280,5 +298,6 @@ sudo iptables -F SBX-ISOLATE && sudo iptables -X SBX-ISOLATE
 sudo docker rm -f sbx-proxy
 sudo docker network rm sbx-internal sbx-egress
 docker rmi harrbjorn/code:latest harrbjorn/pentest:latest harrbjorn/sbx-proxy:latest
+sudo rm /etc/sudoers.d/harrbjorn-sbx   # hvis sudoers-drop-inen er installert
 rm -rf .sandbox
 ```
