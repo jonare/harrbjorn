@@ -1,6 +1,7 @@
-# harrbjorn sandbox: dev environment + Claude Code CLI for autonomous agents.
-# Intended to run with: --read-only --cap-drop ALL --security-opt no-new-privileges,
-# non-privileged user 1000, tmpfs /tmp /var/tmp /home/agent (see run-sandbox.sh).
+# harrbjorn code-agent sandbox: dev environment + Claude Code CLI for
+# autonomous code agents. Intended to run with:
+# --read-only --cap-drop ALL --security-opt no-new-privileges,
+# non-privileged user 1000, tmpfs /tmp /var/tmp /home/agent (see lib/sandbox.sh).
 FROM node:22-bookworm-slim
 
 RUN apt-get update \

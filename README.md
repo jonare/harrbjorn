@@ -1,7 +1,17 @@
-# harrbjorn — isolert sandbox for autonome kodeagenter
+# harrbjorn — isolert sandbox for autonome agenter
 
-Et Docker-oppsett der kodeagenter (Claude Code CLI + generisk dev-miljø) kan
-kjøre autonomt mot en bind-mounted workspace, uten å kunne skade hostsystemet.
+Et Docker-oppsett der agenter (Claude Code CLI) kan kjøre autonomt mot en
+bind-mounted workspace, uten å kunne skade hostsystemet. To usecases, hver
+med sitt oppstartsscript og sitt bilde:
+
+| Usecase | Wrapper | Bilde | Tooling |
+|---|---|---|---|
+| Kodeagent | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, dev/PM-hosts i allowlisten |
+| Sikkerhetstesting | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb; mål legges til med `-a` ved kjør |
+
+Isolasjonskjernen (nettverk, proxy, iptables, model-injeksjon, agent-HOME)
+deles via `lib/sandbox.sh`; wrappers er tynne og setter bare
+`SBX_USECASE`/`SBX_IMAGE`/`SBX_CONTEXT`/`SBX_ALLOWLIST_DEFAULT`.
 
 ## Trusselmodell
 
@@ -45,8 +55,16 @@ host
    ├─ sbx-internal  (bridge, --internal, 172.28.0.0/24 — ingen utgang)
    ├─ sbx-egress    (bridge, 172.29.0.0/24)
    ├─ sbx-proxy     (internal + egress; forward-proxy, allowlist, audit-logg)
-   └─ sandbox       (kun internal; HTTP(S)_PROXY→sbx-proxy:3128, --rm)
+   └─ sandbox       (code- eller pentest-sandbox; kun internal;
+                     HTTP(S)_PROXY→sbx-proxy:3128, --rm)
 ```
+
+To bilder, én del: `harrbjorn/code:latest` og `harrbjorn/pentest:latest`
+kjører begge på `sbx-internal` og deler én `sbx-proxy` og nettverkene.
+Allowlisten er den eneste usecase-spesifikke kjøreparameteren, så bytter
+du usecase endres allowlist-hashen og proxyen restartes automatisk
+(label-hash-sammenligning). Containerenavnet viser usecase:
+`sbx-code-<ts>` / `sbx-pentest-<ts>`.
 
 Isolasjonslag — hvert holder selv hvis ett feiler:
 
@@ -73,42 +91,50 @@ cp .env.example .env                        # valgfrie limit/overrides
 ```
 
 Alt annet (bilder, nettverk, proxy, iptables) settes opp automatisk av
-`run-sandbox.sh` — idempotent.
+`run-code.sh` / `run-pentest.sh` — idempotent.
 
 ## Bruk
 
 ```bash
-./run-sandbox.sh -w <workdir> [--flagg] -- <kommando> [args...]
+./run-code.sh    -w <workdir> [--flagg] -- <kommando> [args...]
+./run-pentest.sh -w <workdir> [--flagg] -- <kommando> [args...]
 ```
 
-Flagg:
+Flagg (identiske i begge):
 
 | Flag | Effekt |
 |---|---|
 | `-w DIR` | Workspace (bindmount til `/work`, rw). Obligatorisk. |
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). |
-| `-f FIL` | Ekstra allowlist-fil (samme format som `allowlist.default`). |
+| `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). |
 | `--no-host-isolation` | Hopp over sudo-iptables-laget (default: på). |
-| `--rebuild` | Bygg bildene på nytt (Claude Code-låses ved build; se Begrensninger). |
+| `--rebuild` | Bygg bilde + proxy på nytt (Claude Code-låses ved build; se Begrensninger). |
 
-Eksempler:
+Eksempler — kodeagent:
 
 ```bash
 # Interaktiv Claude Code-sesjon i et prosjekt
-./run-sandbox.sh -w ~/proj -- claude --dangerously-skip-permissions
+./run-code.sh -w ~/proj -- claude --dangerously-skip-permissions
 
 # Énkjørs-agenter
-./run-sandbox.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen" --dangerously-skip-permissions
-
-# Sikkerhetstesting mot et privat mål (IP-literal i allowlist)
-./run-sandbox.sh -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
-  -- python3 - <<'EOF'
-import urllib.request
-print(urllib.request.urlopen("http://192.168.50.10:8080/", timeout=10).status)
-EOF
+./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen" --dangerously-skip-permissions
 
 # Vanlig dev-bruk
-./run-sandbox.sh -w ~/proj -- bash
+./run-code.sh -w ~/proj -- bash
+```
+
+Eksempler — sikkerhetstesting (målene ligger IKKE i default-allowlisten,
+legges til med `-a` ved kjør):
+
+```bash
+# agent-drevet pentest
+./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
+  -- claude -p "Portscan og test 192.168.50.10" --dangerously-skip-permissions
+
+# direkte verktøy (HTTP-vedkommende verktøy kun — se Begrensninger)
+./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 -- curl -sI http://192.168.50.10:8080/
+./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 \
+  -- sqlmap --proxy http://sbx-proxy:3128 -u "http://192.168.50.10:8080/admin" --batch
 ```
 
 Utgress-audit (pentest-bruk):
@@ -128,15 +154,24 @@ docker logs -f sbx-proxy
 - `*.example.com` → subdomene-vildekart
 - `10.1.2.3[:port]` → IP-literal (pentest-mål; private ranges tillatt)
 
-`allowlist.default` inneholder Claude Code-hosts + dev/PM-hosts;
+Två default-filer, én per usecase:
+
+- `allowlist.code.default` — Claude Code-hosts + dev/PM-hosts (npm, pypi,
+  github, apt).
+- `allowlist.pentest.default` — kun Claude Code/LLM-hostene (bildet er
+  prebygd); pentest-mål legges alltid til med `-a`/-f ved kjør.
+
 `-a` og `-f` legges til ved kjør. Proxyen restartes automatisk når
 allowlisten endrer seg (label-hash-sammenligning); ellers gjenbrukes den.
 
-DNS-rebinding-vern: for hostname-oppføringer reserveres navnet før framover,
-og koplingen avslås hvis noe av adressene ligger i reserverte range
+DNS-rebinding-vern: for hostname-oppføringer resolveres navnet før kobling,
+og koblingen avslås hvis noen av adressene ligger i reserverte range
 (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, fc00::/7, fe80::/10
-samt de to sbx-subnettene). 127/8, 0/8, 169.254/16 og de to sbx-subnettene
-avvises alltid — også for IP-literal-oppføringer.
+samt de to sbx-subnettene) — et hostname kan aldri peke mot disse.
+0/8, 127/8 og 169.254/16 avvises alltid, også for IP-literal-oppføringer.
+De to sbx-subnettene er reserverte kun for hostnames: eksplicitte
+IP-literaler (`172.28.0.1:<port>`) tillates, og det er inngangen til
+host-tjenester (se nedenfor).
 
 ## Host-tjenester
 
@@ -183,21 +218,11 @@ Påvirker kun INPUT-kjeden for sandbox-bridgen; proxy-egress-nettverket
 Kjeden rebuildes fra bunnen ved hver kjør, så portsettet følger alltid
 `SBX_HOST_PORTS`.
 
-Fjerne (hvis du sletter oppsettet helt):
-
-```bash
-sudo iptables -D INPUT -i br-<id12> -j SBX-ISOLATE   # br-<id12> fra:
-docker network inspect -f '{{.Id}}' sbx-internal
-sudo iptables -F SBX-ISOLATE && sudo iptables -X SBX-ISOLATE
-sudo docker rm -f sbx-proxy
-sudo docker network rm sbx-internal sbx-egress
-```
-
 ## Self-test (end-til-end)
 
 ```bash
 mkdir -p /tmp/sbx-test
-./run-sandbox.sh -w /tmp/sbx-test -- sh -c '
+./run-code.sh -w /tmp/sbx-test -- sh -c '
   set -x
   curl -sI https://api.anthropic.com | head -1        # via proxy → OK
   curl -sI https://example.com | head -1              # → 403 (avvist)
@@ -207,8 +232,19 @@ mkdir -p /tmp/sbx-test
   echo x > /work/test && cat /work/test               # OK, eies av uid 1000 på hosten
 '
 docker logs sbx-proxy | tail                            # ALLOWED/DENIED-linjer
-./run-sandbox.sh -w /tmp/sbx-test -- true               # proxy gjenbrukes (hash-match)
+./run-code.sh -w /tmp/sbx-test -- true                  # proxy gjenbrukes (hash-match)
 claude -p --dangerously-skip-permissions "Svar bare: OK"   # agent kjører via proxy
+```
+
+Pentest-variant (mål i allowlisten via `-a`, dev-hosts skal være borte):
+
+```bash
+./run-pentest.sh -w /tmp/sbx-test -a example.com -- sh -c '
+  curl -sI https://example.com | head -1          # → OK (-a tillatt)
+  curl -sI https://pypi.org | head -1             # → 403 (dev-hosts borte i pentest-default)
+'
+docker logs sbx-proxy | tail
+./run-code.sh -w /tmp/sbx-test -- true            # cross-usecase: proxy restart (ny hash)
 ```
 
 ## Begrensninger
@@ -219,11 +255,30 @@ claude -p --dangerously-skip-permissions "Svar bare: OK"   # agent kjører via p
   nettverksarkitekturens garant.
 - Utgang er **proxy-kun**, ikke «proxy-fremst»: rå TCP uten proxy
   feiler trygt (ingen route).
+- Proxy-utgang betyr at **HTTP-vedkommende verktøy** i pentest-sandboxen er
+  de som når målene: curl, python, git m.fl. bruker
+  `HTTP(S)_PROXY`-env-vars automatisk. **sqlmap** må få proxyen eksplisitt:
+  `--proxy http://sbx-proxy:3128`. **nmap/hydra** (rått socket) når **ikke**
+  målene i denne arkitekturen — sikkerhetstesting er agent-/HTTP-drevet.
+- To bilder; hver wrapper bygger sin egen (`--rebuild`). Det gamle
+  `harrbjorn/sandbox:latest` kan prunes.
 - Claude Code-versjonen låses ved bilde-build (auto-update er slått av);
-  bygg på nytt med `--rebuild` for oppdateringer.
+  gjelder begge bildene — bygg på nytt med `--rebuild` for oppdateringer.
 - Fast uid/gid 1000 samsvarer med denne hosten. Bindmounter fra andre
-  uids: juster `--user` og tmpfs-`uid=`/`gid=` i `run-sandbox.sh`.
+  uids: juster `--user` og tmpfs-`uid=`/`gid=` i `lib/sandbox.sh`.
 - `.sandbox/` og `.env` er git-ignoreret (allowlist-sammensmeltning +
   agent-HOME + nøkkel).
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter.
+
+## Fjerne (hvis du sletter oppsettet helt)
+
+```bash
+sudo iptables -D INPUT -i br-<id12> -j SBX-ISOLATE   # br-<id12> fra:
+docker network inspect -f '{{.Id}}' sbx-internal
+sudo iptables -F SBX-ISOLATE && sudo iptables -X SBX-ISOLATE
+sudo docker rm -f sbx-proxy
+sudo docker network rm sbx-internal sbx-egress
+docker rmi harrbjorn/code:latest harrbjorn/pentest:latest harrbjorn/sbx-proxy:latest
+rm -rf .sandbox
+```
