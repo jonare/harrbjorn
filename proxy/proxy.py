@@ -405,9 +405,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             }
             headers["Host"] = host if port == 80 else f"{host}:{port}"
             try:
+                # Origin-form request target: path + query only. An absolute
+                # URL here would make upstreams that match on req.url prefix
+                # (e.g. SPA catch-alls) treat it as an unknown path.
+                target = parsed.path or "/"
+                if parsed.query:
+                    target = f"{target}?{parsed.query}"
                 conn.request(
                     self.command,
-                    parsed._replace(netloc=f"{host}:{port}").geturl(),
+                    target,
                     body=body,
                     headers=headers,
                 )

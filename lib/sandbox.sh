@@ -30,6 +30,10 @@ proxy_running() {
 proxy_hash() {
   $DOCKER inspect -f '{{ index .Config.Labels "sbx.allowlist.hash" }}' sbx-proxy 2>/dev/null
 }
+proxy_image_id() {
+  $DOCKER inspect -f '{{.Image}}' sbx-proxy 2>/dev/null
+}
+image_id() { $DOCKER image inspect -f '{{.Id}}' "$1" 2>/dev/null; }
 
 sbx_main() {
   local WORKDIR="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
@@ -160,13 +164,17 @@ sbx_main() {
   HASH="$(grep -vE '^\s*#' "$MERGED" | sha256sum | awk '{print $1}')"
 
   # ------------------------------------------------------- proxy (re)start
-  if proxy_running && [[ "$(proxy_hash)" == "$HASH" ]]; then
+  # A rebuilt proxy image (new code) must replace the running container,
+  # not just an allowlist change.
+  if proxy_running && [[ "$(proxy_hash)" == "$HASH" ]] \
+    && [[ "$(proxy_image_id)" == "$(image_id harrbjorn/sbx-proxy:latest)" ]]; then
     echo ">> proxy sbx-proxy: reusing (allowlist unchanged)"
   else
     $DOCKER rm -f sbx-proxy >/dev/null 2>&1 || true
     echo ">> proxy sbx-proxy: starting (allowlist hash ${HASH:0:12})"
     $DOCKER run -d --name sbx-proxy \
       --label sbx.allowlist.hash="$HASH" \
+      --label sbx.image.id="$(image_id harrbjorn/sbx-proxy:latest)" \
       --network sbx-internal --network sbx-egress \
       --read-only --tmpfs /tmp:size=32m \
       --cap-drop ALL --security-opt no-new-privileges \
