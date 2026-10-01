@@ -7,6 +7,8 @@
 #   SBX_IMAGE              bildet som bygges ved behov og kjøres
 #   SBX_CONTEXT            build-kontekst (direktori med Dockerfile)
 #   SBX_ALLOWLIST_DEFAULT  default-allowlisten (fil i repo-rotten)
+#   SBX_OPEN_NETWORK       1 = åpen utgang (proxyen slår allowlisten, dev-default)
+#                          0 = allowlisten håndheves (pentest)
 # Wrapperen definerer i tillegg sbx_usage() som skriver sin egen hjelpetekst
 # og avslutter med gitt exit-kode.
 
@@ -21,6 +23,7 @@ SBX_USECASE="${SBX_USECASE:-code}"
 SBX_IMAGE="${SBX_IMAGE:-harrbjorn/code:latest}"
 SBX_CONTEXT="${SBX_CONTEXT:-code}"
 SBX_ALLOWLIST_DEFAULT="${SBX_ALLOWLIST_DEFAULT:-allowlist.code.default}"
+SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
 
 image_exists() { $DOCKER image inspect "$1" >/dev/null 2>&1; }
 
@@ -75,6 +78,11 @@ sbx_main() {
   local SBX_MEMORY="${SBX_MEMORY:-4g}"
   local SBX_CPUS="${SBX_CPUS:-2}"
   local SBX_PIDS="${SBX_PIDS:-1024}"
+  # .env (sourced above) may override the wrapper preset; the wrapper default
+  # is the fallback (code: open egress, pentest: allowlist).
+  local SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
+  local MODE_TAG=""
+  [[ "$SBX_OPEN_NETWORK" == "1" ]] && MODE_TAG=", open network"
   # ----------------------------------------------- model config (injection)
   # The sandbox reuses the host's Claude Code model setup (SBX_CLAUDE_CONFIG,
   # default ~/claude.sh) — same model, effort, context window and key — with
@@ -161,20 +169,24 @@ sbx_main() {
     if [[ -n "$CFG_GATEWAY_ENTRY" ]]; then echo "$CFG_GATEWAY_ENTRY"; fi
   } | sort -u > "$MERGED"
   # Hash only the content lines — the header comment carries a run timestamp.
-  HASH="$(grep -vE '^\s*#' "$MERGED" | sha256sum | awk '{print $1}')"
+  # The open-network mode joins the hash so a mode switch restarts the proxy
+  # even when the merged allowlist is unchanged.
+  HASH="$( { grep -vE '^\s*#' "$MERGED"; printf 'SBX_OPEN_NETWORK=%s\n' "$SBX_OPEN_NETWORK"; } \
+    | sha256sum | awk '{print $1}')"
 
   # ------------------------------------------------------- proxy (re)start
   # A rebuilt proxy image (new code) must replace the running container,
   # not just an allowlist change.
   if proxy_running && [[ "$(proxy_hash)" == "$HASH" ]] \
     && [[ "$(proxy_image_id)" == "$(image_id harrbjorn/sbx-proxy:latest)" ]]; then
-    echo ">> proxy sbx-proxy: reusing (allowlist unchanged)"
+    echo ">> proxy sbx-proxy: reusing (allowlist unchanged${MODE_TAG})"
   else
     $DOCKER rm -f sbx-proxy >/dev/null 2>&1 || true
-    echo ">> proxy sbx-proxy: starting (allowlist hash ${HASH:0:12})"
+    echo ">> proxy sbx-proxy: starting (allowlist hash ${HASH:0:12}${MODE_TAG})"
     $DOCKER run -d --name sbx-proxy \
       --label sbx.allowlist.hash="$HASH" \
       --label sbx.image.id="$(image_id harrbjorn/sbx-proxy:latest)" \
+      -e SBX_PROXY_OPEN="$SBX_OPEN_NETWORK" \
       --network sbx-internal --network sbx-egress \
       --read-only --tmpfs /tmp:size=32m \
       --cap-drop ALL --security-opt no-new-privileges \
@@ -293,7 +305,7 @@ PYEOF
   T="-i"
   [[ -t 0 && -t 1 ]] && T="-it"
 
-  echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS cmd=${CMD[*]}"
+  echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS cmd=${CMD[*]}${MODE_TAG}"
   $DOCKER run --rm $T --name "sbx-$SBX_USECASE-$(date +%s)" \
     --network sbx-internal \
     --user 1000:1000 \

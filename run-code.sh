@@ -8,6 +8,10 @@
 #   Model config: hostens Claude-config (SBX_CLAUDE_CONFIG, default
 #   ~/claude.sh) injiseres som env-vars; loopback -> 172.28.0.1 (host-gw).
 #
+#   Nettverk: åpen utgang som standard (SBX_OPEN_NETWORK=1) — proxyen logger
+#   all trafikk, men håndhever ikke allowlisten. SBX_OPEN_NETWORK=0 (env/.env)
+#   gir klassisk allowlist-adgang (allowlist.code.default + -a/-f).
+#
 # Eksempler:
 #   ./run-code.sh -w ~/proj -- claude --dangerously-skip-permissions
 #   ./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen" --dangerously-skip-permissions
@@ -15,15 +19,18 @@
 #
 # Isolasjonslag (hvert holder selv hvis ett feiler):
 #   1. sandbox kjører kun på --internal-nettverket (ingen direkte utgang)
-#   2. forward-proxy er eneste utgang; håndhever allowlisten
+#   2. forward-proxy er eneste utgang; åpen som standard, audit-logg alltid
 #   3. host-iptables (sudo) blokkerer gateway-IP-holet i intern-bridgen
 #   4. container-hardening: read-only, cap-drop ALL, no-new-privileges, limits
 
 set -euo pipefail
-sbx_usage() { sed -n '2,20p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,24p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code
 export SBX_ALLOWLIST_DEFAULT=allowlist.code.default
+# Dev-usecase: åpen utgang som standard (proxy-logging beholdes).
+# .env/env med SBX_OPEN_NETWORK=0 vinner, og gir allowlist-adgang.
+export SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/sandbox.sh"
 sbx_main "$@"

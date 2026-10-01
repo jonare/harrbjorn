@@ -6,7 +6,7 @@ med sitt oppstartsscript og sitt bilde:
 
 | Usecase | Wrapper | Bilde | Tooling |
 |---|---|---|---|
-| Kodeagent | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, dev/PM-hosts i allowlisten |
+| Kodeagent | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, åpen nettverksutgang som standard |
 | Sikkerhetstesting | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb; mål legges til med `-a` ved kjør |
 
 Isolasjonskjernen (nettverk, proxy, iptables, model-injeksjon, agent-HOME)
@@ -19,9 +19,12 @@ Den innsperrede agenten skal:
 
 - **kun** skrive i den spesifiserte workspace-direktivet (rw-bindmount til `/work`)
   og sin egen agent-HOME (persistert under `.sandbox/agent-home`)
-- **kun** ha nettverksutgang til en konfigurerbar host-whitelist over http(s)
-  (fungerer også for sikkerhetstesting mot whitelistede mål, inkl. IP-literaler)
-- **ikke** nå hosten eller internettet utover whitelisten
+- **kun** ha nettverksutgang via forward-proxyen over http(s):
+  - **kodeagent**: åpen utgang som standard (`SBX_OPEN_NETWORK=1`);
+    `SBX_OPEN_NETWORK=0` gir klassisk host(:port)-whitelist
+  - **sikkerhetstesting**: kun allowlistede mål (legges til med `-a`,
+    inkl. IP-literaler)
+- **ikke** nå hosten utover tillatne porter (`SBX_HOST_PORTS`)
 - **ikke** kunne skade hosten via filsystemet (read-only rootfs, unprivilegert bruker)
 
 Model-backend:
@@ -54,23 +57,27 @@ host
 └─ docker
    ├─ sbx-internal  (bridge, --internal, 172.28.0.0/24 — ingen utgang)
    ├─ sbx-egress    (bridge, 172.29.0.0/24)
-   ├─ sbx-proxy     (internal + egress; forward-proxy, allowlist, audit-logg)
+   ├─ sbx-proxy     (internal + egress; forward-proxy; allowlist eller
+   │                  åpen utgang per usecase, audit-logg alltid)
    └─ sandbox       (code- eller pentest-sandbox; kun internal;
                      HTTP(S)_PROXY→sbx-proxy:3128, --rm)
 ```
 
 To bilder, én del: `harrbjorn/code:latest` og `harrbjorn/pentest:latest`
 kjører begge på `sbx-internal` og deler én `sbx-proxy` og nettverkene.
-Allowlisten er den eneste usecase-spesifikke kjøreparameteren, så bytter
-du usecase endres allowlist-hashen og proxyen restartes automatisk
-(label-hash-sammenligning). Containerenavnet viser usecase:
+Allowlisten og utgangsmoden (`SBX_OPEN_NETWORK`) er usecase-spesifikke
+kjøreparametere, så bytter du usecase endres hashen og proxyen restartes
+automatisk (label-hash-sammenligning). Containerenavnet viser usecase:
 `sbx-code-<ts>` / `sbx-pentest-<ts>`.
 
 Isolasjonslag — hvert holder selv hvis ett feiler:
 
 1. **Internal-nettverk** — kjernepolitikk: agenten kan fysisk ikke åpne
    en rå socket til internett. Verktøy som ignorerer proxy-env-vars feiler trygt.
-2. **Proxy-whitelist** — eneste utgang; håndhever host(:port)-whitelist,
+2. **Proxy-utgang** — eneste utgang; kodeagent har åpen utgang som standard
+   (`SBX_OPEN_NETWORK=1`), sikkerhetstesting håndhever host(:port)-allowlisten.
+   Åpen modus: permanent-avvis-settet (loopback, 0/8, 169.254/16) og
+   DNS-rebinding-vern gjelder fortsatt, og all trafikk logges.
    CONNECT-tunnel for HTTPS (ingen MITM), logger ALLOWED/DENIED til stdout.
 3. **Host-iptables** (sudo, idempotent) — blockerer gateway-IP-holet: selv et
    `--internal`-nettverk slupper gateway-IP (172.28.0.1 = hosten) gjennom til
@@ -105,10 +112,20 @@ Flagg (identiske i begge):
 | Flag | Effekt |
 |---|---|
 | `-w DIR` | Workspace (bindmount til `/work`, rw). Obligatorisk. |
-| `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). |
-| `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). |
+| `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). Bare relevant i allowlist-modus. |
+| `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). Bare relevant i allowlist-modus. |
 | `--no-host-isolation` | Hopp over sudo-iptables-laget (default: på). |
 | `--rebuild` | Bygg bilde + proxy på nytt (Claude Code-låses ved build; se Begrensninger). |
+
+Miljøvariabel (`env`/`.env`, vinner over wrapper-default):
+
+| Variable | Verdi | Effekt |
+|---|---|---|
+| `SBX_OPEN_NETWORK` | `1` | Åpen utgang: proxyen logger all trafikk, men slår allowlisten. |
+| | `0` | Allowlisten håndheves (default-allowlisten + `-a`/`-f`). |
+
+Default: `code=1` (åpen), `pentest=0` (allowlist). Bytter modus gir ny
+hash → proxyen restartes automatisk.
 
 Eksempler — kodeagent:
 
@@ -157,7 +174,8 @@ docker logs -f sbx-proxy
 Två default-filer, én per usecase:
 
 - `allowlist.code.default` — Claude Code-hosts + dev/PM-hosts (npm, pypi,
-  github, apt).
+  github, apt). Brukes bare når kodeagent kjører med `SBX_OPEN_NETWORK=0`
+  (default er åpen utgang).
 - `allowlist.pentest.default` — kun Claude Code/LLM-hostene (bildet er
   prebygd); pentest-mål legges alltid til med `-a`/-f ved kjør.
 
@@ -242,15 +260,21 @@ Filen må ligge uten prikk i navnet, ellers ignorerer sudo den. Sjekk
 mkdir -p /tmp/sbx-test
 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   set -x
-  curl -sI https://api.anthropic.com | head -1        # via proxy → OK
-  curl -sI https://example.com | head -1              # → 403 (avvist)
-  curl -s --max-time 5 http://172.28.0.1/ || true     # host-gateway (uten port) → 403 (proxy)
+  curl -sI https://api.anthropic.com | head -1         # via proxy → OK
+  curl -sI https://example.com | head -1               # → OK (åpen utgang som standard)
+  curl -s --max-time 5 http://172.28.0.1/ || true      # host-gw port 80 → iptables DROP (timeout) eller 502
   curl -s --max-time 5 http://172.28.0.1:8000/ || true # host-modellserver → OK (SBX_HOST_PORTS)
-  echo x > /etc/test || true                          # → Read-only file system
-  echo x > /work/test && cat /work/test               # OK, eies av uid 1000 på hosten
+  echo x > /etc/test || true                           # → Read-only file system
+  echo x > /work/test && cat /work/test                # OK, eies av uid 1000 på hosten
 '
-docker logs sbx-proxy | tail                            # ALLOWED/DENIED-linjer
-./run-code.sh -w /tmp/sbx-test -- true                  # proxy gjenbrukes (hash-match)
+docker logs sbx-proxy | tail                             # ALLOWED-linjer (logges også i åpen modus)
+
+# Allowlist-modus for kodeagent (proxy restartes: ny hash — annen modus):
+SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- sh -c '
+  curl -sI https://api.anthropic.com | head -1           # → OK (i allowlist.code.default)
+  curl -sI https://example.com | head -1                 # → 403 (avvist)
+'
+SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- true # proxy gjenbrukes (hash-match i allowlist-modus)
 claude -p --dangerously-skip-permissions "Svar bare: OK"   # agent kjører via proxy
 ```
 
@@ -273,6 +297,10 @@ docker logs sbx-proxy | tail
   nettverksarkitekturens garant.
 - Utgang er **proxy-kun**, ikke «proxy-fremst»: rå TCP uten proxy
   feiler trygt (ingen route).
+- Åpen utgang (`SBX_OPEN_NETWORK=1`) er et bevisst default for kodeagenten:
+  all trafikk logges fortsatt, permanent-avvis-settet (loopback, 0/8,
+  169.254/16), DNS-rebinding-vern, host-iptables og container-hardening
+  holder likevel. `SBX_OPEN_NETWORK=0` gir klassisk allowlist-utgang.
 - Proxy-utgang betyr at **HTTP-vedkommende verktøy** i pentest-sandboxen er
   de som når målene: curl, python, git m.fl. bruker
   `HTTP(S)_PROXY`-env-vars automatisk. **sqlmap** må få proxyen eksplisitt:

@@ -23,6 +23,12 @@ reserved ranges (including the sandbox subnets - so a hostname can never
 stealthily point at the host bridge gateway). IP-literal entries are
 checked against the always-deny set (loopback, unspecified, link-local);
 everything else is governed purely by the allowlist.
+
+SBX_PROXY_OPEN=1 (dev use case): the allowlist gate is bypassed - every
+host:port is allowed - but the always-deny set and the DNS-rebinding guard
+still apply, and every request is still logged. The allowlist file is
+still loaded and hashed (so switching modes restarts the proxy), it just
+stops governing access.
 """
 
 import ipaddress
@@ -39,6 +45,7 @@ from urllib.parse import urlparse
 
 PORT = int(os.environ.get("SBX_PROXY_PORT", "3128"))
 ALLOWLIST_FILE = os.environ.get("ALLOWLIST_FILE", "/allowlist/allowlist.txt")
+SBX_PROXY_OPEN = os.environ.get("SBX_PROXY_OPEN", "0") == "1"
 CONNECT_IDLE_SECONDS = int(os.environ.get("CONNECT_IDLE_SECONDS", "600"))
 MAX_BODY_BYTES = int(os.environ.get("SBX_PROXY_MAX_BODY", str(200 * 1024 * 1024)))
 CONNECT_TIMEOUT_SECONDS = 30
@@ -104,7 +111,14 @@ class Allowlist:
         return len(self.hosts) + len(self.wildcards) + len(self.ipnets)
 
     def allowed(self, name, port):
-        """Return True if (name, port) may be reached."""
+        """Return True if (name, port) may be reached.
+
+        In open-network mode (dev use case) the allowlist gate is off; the
+        always-deny set (upstream_addrs) and the DNS-rebinding guard
+        (resolve_checked) still run for every target.
+        """
+        if SBX_PROXY_OPEN:
+            return True
         try:
             ip = ipaddress.ip_address(name)
         except ValueError:
@@ -504,7 +518,13 @@ def main():
     logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(message)s")
     sys.stdout.reconfigure(line_buffering=True)
     ALLOWLIST = load_allowlist(ALLOWLIST_FILE)
-    log.info("loaded %d allowlist entries from %s", len(ALLOWLIST), ALLOWLIST_FILE)
+    if SBX_PROXY_OPEN:
+        log.info(
+            "open-network mode: allowlist gate bypassed "
+            "(always-deny + DNS-rebinding guard still active)"
+        )
+    else:
+        log.info("loaded %d allowlist entries from %s", len(ALLOWLIST), ALLOWLIST_FILE)
     server = ThreadingHTTPServer(("0.0.0.0", PORT), ProxyHandler)
     server.daemon_threads = True
     log.info("listening on 0.0.0.0:%d", PORT)
