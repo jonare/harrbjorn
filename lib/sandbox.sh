@@ -266,7 +266,8 @@ sbx_main() {
   # login/API-key) and the /work trust dialog are skipped entirely. The custom
   # API key from the model config is added to the approved list (the wizard
   # would otherwise validate it against the real Anthropic API and reject it).
-  # Existing state is merged, never replaced.
+  # The container's permission mode defaults to bypassPermissions. Existing
+  # state is merged, never replaced.
   local CFG_API_KEY="" kv
   for kv in "${CONFIG_ENV[@]}"; do
     case "$kv" in ANTHROPIC_API_KEY=*) CFG_API_KEY="${kv#ANTHROPIC_API_KEY=}" ;; esac
@@ -292,9 +293,18 @@ with open(tmp, "w") as f: json.dump(d, f, indent=2)
 os.replace(tmp, cj)
 os.chmod(cj, 0o600)
 ss = os.path.join(home, ".claude", "settings.json")
-if not os.path.exists(ss):
-    os.makedirs(os.path.dirname(ss), exist_ok=True)
-    with open(ss, "w") as f: json.dump({"theme": "dark"}, f)
+os.makedirs(os.path.dirname(ss), exist_ok=True)
+try:
+    with open(ss) as f: s = json.load(f)
+except (FileNotFoundError, ValueError):
+    s = {"theme": "dark"}
+# The sandbox IS the permission boundary: the container's claude runs with
+# bypassPermissions by default (user-level settings — the only place that
+# mode is honored), so no --dangerously-skip-permissions flag is needed.
+# Existing keys are merged, never replaced.
+s.setdefault("skipDangerousModePermissionPrompt", True)
+s.setdefault("permissions", {}).setdefault("defaultMode", "bypassPermissions")
+with open(ss, "w") as f: json.dump(s, f, indent=2)
 PYEOF
   else
     echo "warn: python3 not found; agent HOME not pre-seeded, first-run wizard will appear." >&2

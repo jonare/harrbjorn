@@ -14,7 +14,9 @@
 #
 # Eksempler:
 #   ./run-code.sh -w ~/proj -- claude --dangerously-skip-permissions
-#   ./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen" --dangerously-skip-permissions
+#   ./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen"
+#   (containernens claude kjører med bypassPermissions som default — ingen
+#    --dangerously-skip-permissions-flagg nødvendig)
 #   ./run-code.sh -w ~/proj -- bash
 #
 # Isolasjonslag (hvert holder selv hvis ett feiler):
@@ -24,7 +26,7 @@
 #   4. container-hardening: read-only, cap-drop ALL, no-new-privileges, limits
 
 set -euo pipefail
-sbx_usage() { sed -n '2,24p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,26p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code

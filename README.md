@@ -87,7 +87,10 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
    `--security-opt no-new-privileges`, uid 1000, tmpfs over /tmp og /var/tmp,
    persistent agent-HOME (`.sandbox/agent-home` — Claude Code sitt
    onboarding/settings-state, pre-seedet ved hver kjør: onboarding fullført,
-   `/work`-trust-dialog acceptert, modelconfigens API-key approvet — så
+   `/work`-trust-dialog acceptert, modelconfigens API-key approvet,
+   permission-mode satt til `bypassPermissions` (containernens claude kjører
+   altså uten `--dangerously-skip-permissions`-flagg; gjelder KUN denne
+   user-level-configen i agent-HOME — hostens `~/.claude` røres ikke) — så
    first-run-vizarden hoppes over helt), pids/memory/cpu-limit.
 
 ## Setup
@@ -131,10 +134,10 @@ Eksempler — kodeagent:
 
 ```bash
 # Interaktiv Claude Code-sesjon i et prosjekt
-./run-code.sh -w ~/proj -- claude --dangerously-skip-permissions
+./run-code.sh -w ~/proj -- claude
 
 # Énkjørs-agenter
-./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen" --dangerously-skip-permissions
+./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen"
 
 # Vanlig dev-bruk
 ./run-code.sh -w ~/proj -- bash
@@ -146,7 +149,7 @@ legges til med `-a` ved kjør):
 ```bash
 # agent-drevet pentest
 ./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
-  -- claude -p "Portscan og test 192.168.50.10" --dangerously-skip-permissions
+  -- claude -p "Portscan og test 192.168.50.10"
 
 # direkte verktøy (HTTP-vedkommende verktøy kun — se Begrensninger)
 ./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 -- curl -sI http://192.168.50.10:8080/
@@ -275,7 +278,9 @@ SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   curl -sI https://example.com | head -1                 # → 403 (avvist)
 '
 SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- true # proxy gjenbrukes (hash-match i allowlist-modus)
-claude -p --dangerously-skip-permissions "Svar bare: OK"   # agent kjører via proxy
+claude -p "Svar bare: OK"                                  # agent kjører via proxy
+# (containernens claude kjører med bypassPermissions som default — se
+# «Container-hardening»; ingen --dangerously-skip-permissions nødvendig)
 ```
 
 Pentest-variant (mål i allowlisten via `-a`, dev-hosts skal være borte):
