@@ -1,5 +1,10 @@
 # harrbjorn — isolert sandbox for autonome agenter
 
+## ADVARSEL: VIBEKODET TULLBALL
+**Dette prosjektet er et vibekodet eksperiment! Det har kjente mangler, sårbarheter og problemer og kan ikke brukes i noe produksjonsmijø!**
+
+## Oppsett
+
 Et Docker-oppsett der agenter (Claude Code CLI) kan kjøre autonomt mot en
 bind-mounted workspace, uten å kunne skade hostsystemet. To usecases, hver
 med sitt oppstartsscript og sitt bilde:
