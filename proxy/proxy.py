@@ -8,7 +8,8 @@ route out of the sandbox container:
   - HTTPS (CONNECT) is tunnelled as raw bytes - no MITM, no TLS termination.
   - Everything not on the allowlist is denied with 403.
 
-Every request is logged to stdout (docker logs sbx-proxy) as an audit line:
+Every request is logged to stdout (podman logs <proxy container>) as an
+audit line:
   2026-01-01 00:00:00,000 client=... method=... target=host:port action=ALLOWED|DENIED
 
 Allowlist file (one entry per line, '#' comments):
@@ -29,6 +30,13 @@ host:port is allowed - but the always-deny set and the DNS-rebinding guard
 still apply, and every request is still logged. The allowlist file is
 still loaded and hashed (so switching modes restarts the proxy), it just
 stops governing access.
+
+SBX_PROXY_TRUSTED: comma-separated host:port pairs that are trusted
+upstreams at the config level (e.g. the host model server reachable as
+host.containers.internal:8000 through the runtime's pasta host address).
+Trusted entries are allowed in both modes and are exempt from the
+always-deny set and the DNS-rebinding guard - they are never sourced
+from the user allowlist file.
 """
 
 import ipaddress
@@ -52,6 +60,21 @@ CONNECT_TIMEOUT_SECONDS = 30
 
 log = logging.getLogger("sbx-proxy")
 
+# Config-level trusted upstreams: host -> port set (empty set = any port).
+SBX_PROXY_TRUSTED = os.environ.get("SBX_PROXY_TRUSTED", "")
+TRUSTED = {}
+for _entry in SBX_PROXY_TRUSTED.split(","):
+    _entry = _entry.strip()
+    if not _entry:
+        continue
+    _name, _, _p = _entry.rpartition(":")
+    try:
+        TRUSTED[_name.lower().rstrip(".")] = (
+            frozenset([int(_p)]) if _p else frozenset()
+        )
+    except ValueError:
+        log.warning("SBX_PROXY_TRUSTED: bad entry %r, skipping", _entry)
+
 # Reserved ranges a hostname entry must never resolve to (defeats
 # DNS-rebinding / "my domain points at the host" tricks).
 RESERVED_NETS = [
@@ -62,8 +85,8 @@ RESERVED_NETS = [
         "10.0.0.0/8",
         "172.16.0.0/12",
         "192.168.0.0/16",
-        "172.28.0.0/24",  # sbx-internal
-        "172.29.0.0/24",  # sbx-egress
+        "172.28.0.0/24",  # legacy sbx-internal subnet (per-session nets now)
+        "172.29.0.0/24",  # legacy sbx-egress subnet
         "::1/128",
         "fc00::/7",
         "fe80::/10",
@@ -71,10 +94,10 @@ RESERVED_NETS = [
     )
 ]
 
-# Always denied even for explicit IP-literal entries. The sandbox subnets are
-# NOT here: the host bridge gateway (172.28.0.1) is a legitimate target for
-# host services (e.g. a local model server) when the operator allows it
-# explicitly in the allowlist (plus the matching host-iptables port).
+# Always denied even for explicit IP-literal entries. The host pasta address
+# (169.254.1.2, "host.containers.internal") is link-local and thus in the
+# always-deny set: the host model server is reachable only via
+# SBX_PROXY_TRUSTED, never via the user allowlist.
 ALWAYS_DENY_NETS = [
     ipaddress.ip_network(n) for n in (
         "0.0.0.0/8",
@@ -117,6 +140,9 @@ class Allowlist:
         always-deny set (upstream_addrs) and the DNS-rebinding guard
         (resolve_checked) still run for every target.
         """
+        tname = name.lower().rstrip(".")
+        if tname in TRUSTED:
+            return _port_allowed(TRUSTED[tname], port)
         if SBX_PROXY_OPEN:
             return True
         try:
@@ -245,10 +271,17 @@ def resolve_checked(name, port):
 def upstream_addrs(name, port):
     """Return candidate (family, sockaddr) tuples for the target.
 
-    IP literals are checked against the always-deny set only (an explicit
-    172.28.0.1:8000 entry must be able to reach the host bridge gateway).
-    Hostnames go through the DNS-rebinding guard (resolve_checked).
+    IP literals are checked against the always-deny set only. Hostnames go
+    through the DNS-rebinding guard (resolve_checked), except trusted
+    upstreams, which connect directly.
     """
+    if name.lower().rstrip(".") in TRUSTED:
+        return [
+            (family, sockaddr)
+            for family, _type, _proto, _canon, sockaddr in socket.getaddrinfo(
+                name, port, proto=socket.IPPROTO_TCP
+            )
+        ]
     try:
         ip = ipaddress.ip_address(name)
     except ValueError:

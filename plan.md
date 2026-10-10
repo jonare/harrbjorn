@@ -57,13 +57,19 @@ agent-HOME. Se «Relatert» nederst; ny design gjør fiksen enkel.
   `crun`. `crun` kun med eksplisitt `SBX_RUNTIME=crun`.
 - Sjekk `/dev/kvm` ved oppstart når `SBX_RUNTIME=krun`.
 
-**Avklares (spike før implementasjon)**
-- Fungerer krun med `--read-only`, tmpfs-mounts, `--userns=keep-id` og
-  `--network <internal>` sammen? Hvordan oppfører krun-nettverket seg
-  (TSI vs. virtio-net) mot et `--internal`-nettverk: må fortsatt ikke gi
-  utgang utenom proxyen.
-- Ytelse for `npm install`/bygg over virtiofs-mount, og oppstartstid.
-- Minne-overhead per VM på laptop.
+**Avklart (spike 2026-10-09, podman 5.8.7, Fedora 44, crun-krun 1.28)**
+- krun + `--read-only` + tmpfs + `--userns=keep-id` + `--internal`
+  fungerer: gjenkjern (6.12.109 vs. host 7.2.8), agent uid 1000, rootfs
+  skrivebeskyttet, ingen utgang (IP-literaler → «Network is unreachable»).
+- Podman 5.8 avviser `--tmpfs /tmp:uid=1000` og `--mount`-`uid=` som
+  rootless; bruk `--mount type=tmpfs,destination=/tmp` (1777, eier 0:0).
+  keep-id gjør uid-hardkoding overflødig — agent (1000) skriver fritt.
+- Ytelse: tmpfs 449 MB/s skrive / 2.7 GB/s lese; bind-mount (virtio-fs)
+  krever SELinux-`z` (sonst EACCES, også under crun); `npm install express`
+  (65 moduler) totalt ~3,5 s inkl. oppstart. Oppstart ~0,6 s.
+- Minne: ~88 MB RSS per hvilende VM (VmSize ~3,2 GB, reservert gjeast-RAM).
+- Ressursgrenser (`--memory`, `--cpus`, `--pids-limit`) virker under krun
+  (cgroup v2-delegering er i orden).
 
 **Verifiser**
 - `uname -r` i containeren er en annen kjerne enn hosten (krun).
@@ -113,8 +119,10 @@ fungerer ikke; bruk separate nettverk som under.
 **Design**
 - Per sesjon `S` (f.eks. `sbx-<usecase>-<ts>`):
   - `podman network create --internal sbx-$S-int`
-  - proxy-container `sbx-$S-proxy` på `sbx-$S-int` + standard rootless-nett
-    (pasta) for utgang
+  - proxy-container `sbx-$S-proxy` på standard rootless-nett (pasta) +
+    `sbx-$S-int`, med bindet per-sesjons `resolv.conf` der hostens
+    oppstrøms-DNS er den(e) eneste namneserveren(e) (aardvark må aldri
+    stå først — se «Avklart» nedenfor)
   - sandbox-container kun på `sbx-$S-int`, `HTTP(S)_PROXY=http://sbx-$S-proxy:3128`
 - `trap` i wrapperen fjerner proxy og nettverk ved avslutning (også ved
   feil/Ctrl-C). Opprydding av foreldreløse `sbx-*`-ressurser ved oppstart.
@@ -129,14 +137,35 @@ fungerer ikke; bruk separate nettverk som under.
   `adresse:port` fra punkt 3. Base-URL-omskrivingen endres fra
   `172.28.0.1` til denne adressen.
 
-**Avklares (spike)**
-- Hvilke hostadresser pasta eksponerer som standard i Podman-versjonen på
-  laptopen (`map-gw`/`map-guest-addr`), og hvordan begrense til kun
-  modellserver-porten. Mål: sandboxen når aldri hosten direkte, proxyen når
-  kun modellserverporten.
-- DNS på `--internal`-nett: aardvark-dns skal løse `sbx-$S-proxy`, men ikke
-  videresende eksterne navn fra sandboxen (hindrer DNS-tunnel).
-- Om strømming mot modellserveren krever direkte rute i stedet for proxy.
+**Avklart (spike 2026-10-09)**
+- Hosten synes som `host.containers.internal` → **169.254.1.2** (stabil,
+  bekreftet i to containere); pastas DNS-forwarder er 169.254.1.1.
+  Fra sandboxen (kun `--internal`) er 169.254.1.1/169.254.1.2 uløsbare og
+  uregable («Network is unreachable») — hosten nås aldri direkte.
+  Begrensning til modellserverporten gjøres altså i proxyens policy, ikke
+  i pasta-flagg.
+- DNS på `--internal`: aardvark løser `sbx-$S-proxy` ✓, eksterne navn →
+  NXDOMAIN ✓ (ingen DNS-tunnel fra sandboxen).
+- **Funn:** multi-homed proxy (internal + default) får resolv.conf fra det
+  primære nettverket (internal), så proxyens egen eksterne DNS bryter
+  (502 på alt). Røtt: glibc behandler den *første* namneserverens svar som
+  endelig — aardvark svarer NXDOMAIN på alle eksterne namn, og glibc
+  fell aldri tilbake til neste NS (kontrollkjøring: NS-rekkefølge
+  avgjør resultatet). Løst med bindet per-sesjons `resolv.conf` der
+  hostens oppstrøms-DNS er einaste namneserver. Pasta-forwarderen
+  (169.254.1.1) trengst ikkje: glibc sender ikkje EDNS0 på vanlege
+  A-lookup, og forwarderens EDNS0-bug (FORMERR) slår derfor ikkje til.
+- **Funn:** allowlistposten `host.containers.internal:8000` avvises av
+  proxy.py-s DNS-rebindingsvern (169.254.1.2 er link-local). Modellserveren
+  må derfor behandles som konfigurasjonsnivå-unntak
+  (f.eks. `SBX_PROXY_TRUSTED_ADDR` / Smokescreen `--allow-address`), ikke
+  som en brukerkommentert allowlistpost.
+- Strømming mot modellserveren: proxy.py bufres/trunkerer HTTP-svar
+  (kjent funn); plain-HTTP over proxy krever strømande proxy —
+  verifiseres mot Smokescreen i punkt 3.
+- **Funn:** proxy.py avslutter ikke på SIGTERM (ThreadingHTTPServer-tråder
+  er ikke-daemon) → ryddingen tar 10 s + SIGKILL. Smokescreen erstatter
+  den; trap må likevel forvente hard kill ved cleanup.
 
 **Verifiser**
 - Fra sandboxen: rå TCP til internett, til `host.containers.internal:22`,
