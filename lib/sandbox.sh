@@ -57,7 +57,8 @@ sbx_reap_orphans() {
   # Age-gated: a session under an hour may still be between writing the
   # file and mounting it; a live older session keeps its mount alive
   # through the underlying inode either way.
-  find "$STATE_DIR" -maxdepth 1 -name 'resolv-*.conf' -mmin +60 -delete \
+  find "$STATE_DIR" -maxdepth 1 \
+    \( -name 'resolv-*.conf' -o -name 'allowlist-*.txt' \) -mmin +60 -delete \
     >/dev/null 2>&1 || true
 }
 
@@ -231,7 +232,10 @@ sbx_main() {
   mkdir -p "$STATE_DIR"
   [[ -f "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" ]] \
     || { echo "error: allowlist default '$SBX_ALLOWLIST_DEFAULT' not found" >&2; exit 1; }
-  MERGED="$STATE_DIR/allowlist.txt"
+  # Per-session merged allowlist: concurrent sessions (code + pentest) must
+  # not share one file — each proxy loads whatever the other session wrote
+  # last, and -a targets would be lost.
+  MERGED="$STATE_DIR/allowlist-$S.txt"
   {
     echo "# merged at $(date -u +%Y-%m-%dT%H:%M:%SZ) by harrbjorn $SBX_USECASE"
     grep -vE '^\s*(#|$)' "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" || true
@@ -266,6 +270,7 @@ sbx_main() {
   } > "$RESOLV_CONF"
   echo ">> proxy $PROXY_NAME: starting (net $NET_NAME${MODE_TAG}, dns: $(printf '%s' "$DNS" | tr '\n' ' '))"
   $PODMAN run -d --name "$PROXY_NAME" \
+    --userns=keep-id:uid=1000,gid=1000 \
     --network podman --network "$NET_NAME" \
     -v "$RESOLV_CONF:/etc/resolv.conf:ro,z" \
     -e SBX_PROXY_OPEN="$SBX_OPEN_NETWORK" \
@@ -359,6 +364,7 @@ PYEOF
 
   echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS cmd=${CMD[*]}${MODE_TAG}"
   $PODMAN run --rm $T --name "$SBX_NAME" \
+    --userns=keep-id:uid=1000,gid=1000 \
     --network "$NET_NAME" \
     --user 1000:1000 \
     -v "$WORKDIR_ABS:/work:z" -v "$AGENT_HOME:/home/agent:z" -w /work \
