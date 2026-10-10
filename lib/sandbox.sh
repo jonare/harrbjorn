@@ -136,6 +136,12 @@ sbx_main() {
   local SBX_MEMORY="${SBX_MEMORY:-4g}"
   local SBX_CPUS="${SBX_CPUS:-2}"
   local SBX_PIDS="${SBX_PIDS:-1024}"
+  # Terminal locale, injected as -e LANG so the host keyboard's multi-byte
+  # UTF-8 (å/ø/æ) works in interactive mode (the image defaults to the same).
+  # Must be a locale the image generated: nb_NO.UTF-8 (default) / en_US.UTF-8.
+  # .env wins; the value is not re-derived from the host on purpose (a C host
+  # would silently re-break it).
+  local SBX_LOCALE="${SBX_LOCALE:-nb_NO.UTF-8}"
   # .env (sourced above) may override the wrapper preset; the wrapper default
   # is the fallback (code: open egress, pentest: allowlist).
   local SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
@@ -370,6 +376,7 @@ PYEOF
     -v "$WORKDIR_ABS:/work:z" -v "$AGENT_HOME:/home/agent:z" -w /work \
     "${CONFIG_ENV[@]}" \
     -e HOME=/home/agent \
+    -e LANG="$SBX_LOCALE" \
     -e HTTP_PROXY="http://$PROXY_NAME:3128" -e http_proxy="http://$PROXY_NAME:3128" \
     -e HTTPS_PROXY="http://$PROXY_NAME:3128" -e https_proxy="http://$PROXY_NAME:3128" \
     -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1' \

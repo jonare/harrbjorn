@@ -26,8 +26,19 @@ RUN apt-get update \
         tar \
         unzip \
         zip \
+        locales \
  && rm -rf /var/lib/apt/lists/* \
  && npm install -g @anthropic-ai/claude-code@2.1.296
+
+# The base image ships only the POSIX/C locale (LC_CTYPE=POSIX, single-byte),
+# which mis-handles the multi-byte UTF-8 a Norwegian keyboard emits for
+# å/ø/æ in interactive mode. Generate a Norwegian UTF-8 locale plus a neutral
+# en_US.UTF-8 fallback, and default to Norwegian. The wrapper can override via
+# SBX_LOCALE (see lib/sandbox.sh); it must be one of the locales generated here.
+RUN printf 'nb_NO.UTF-8 UTF-8\nen_US.UTF-8 UTF-8\n' >> /etc/locale.gen \
+ && locale-gen
+
+ENV LANG=nb_NO.UTF-8
 
 # node:slim already provides uid 1000 (the 'node' user); rename it so the
 # sandbox user has a stable name regardless of the base image's choice.

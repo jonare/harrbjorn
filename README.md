@@ -126,6 +126,8 @@ Miljøvariabel (`env`/`.env`, vinner over wrapper-default):
 |---|---|---|
 | `SBX_OPEN_NETWORK` | `1` | Åpen utgang: proxyen logger all trafikk, men slår allowlisten. |
 | | `0` | Allowlisten håndheves (default-allowlisten + `-a`/`-f`). |
+| `SBX_LOCALE` | `nb_NO.UTF-8` | Terminal-lokal (injectert som `LANG`). Norsk tastatur å/ø/æ i interaktiv modus. Default. |
+| | `en_US.UTF-8` | Nøytralt UTF-8-alternativ. Må være generert i bildet (se `code/Dockerfile`). |
 
 Default: `code=1` (åpen), `pentest=0` (allowlist). Bytter modus gir ny
 hash → proxyen restartes automatisk.
