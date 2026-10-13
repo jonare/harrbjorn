@@ -107,6 +107,7 @@ for link in data:
 
 sbx_main() {
   local WORKDIR="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
+  local HOST_PORTS=()
   local REBUILD=0 T CONFIG_ENV=() MERGED
   local S SBX_NAME PROXY_TRUSTED=""
 
@@ -114,6 +115,7 @@ sbx_main() {
     case "$1" in
       -w) WORKDIR="$2"; shift 2 ;;
       -a) EXTRA_HOSTS+=("$2"); shift 2 ;;
+      -H) HOST_PORTS+=("$2"); shift 2 ;;
       -f) EXTRA_ALLOWLIST="$2"; shift 2 ;;
       --rebuild) REBUILD=1; shift ;;
       -h|--help) sbx_usage 0 ;;
@@ -186,6 +188,29 @@ sbx_main() {
   else
     echo "warn: no model config at $SBX_CLAUDE_CONFIG; falling back to ANTHROPIC_API_KEY in .env." >&2
     CONFIG_ENV=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env, or provide a model config via SBX_CLAUDE_CONFIG}")
+  fi
+
+  # ---------------------------------------------------- host ports (explicit)
+  # -H <port>: host ports the sandbox may reach (test instances on the host,
+  # e.g. 8080). Each port becomes a trusted proxy upstream for
+  # host.containers.internal — an explicit, per-port runtime exception.
+  # The host address is link-local, so the proxy's always-deny and
+  # DNS-rebind guards refuse it no matter what the user allowlist (or open
+  # network) says: the host is only ever reachable here.
+  local p
+  if (( ${#HOST_PORTS[@]} )); then
+    for p in "${HOST_PORTS[@]}"; do
+      p="${p//[[:space:]]/}"
+      if [[ ! "$p" =~ ^[0-9]+$ ]] || ! (( p >= 1 && p <= 65535 )); then
+        echo "error: -H: bad port '$p' (need 1-65535)" >&2
+        sbx_usage 1
+      fi
+      case " $PROXY_TRUSTED " in
+        *" host.containers.internal:$p "*) ;;
+        *) PROXY_TRUSTED="${PROXY_TRUSTED:+$PROXY_TRUSTED,}host.containers.internal:$p" ;;
+      esac
+    done
+    echo ">> host ports: ${HOST_PORTS[*]} (via host.containers.internal)"
   fi
 
   # ----------------------------------------------------------- podman check

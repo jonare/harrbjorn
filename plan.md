@@ -160,6 +160,11 @@ fungerer ikke; bruk separate nettverk som under.
   må derfor behandles som konfigurasjonsnivå-unntak
   (f.eks. `SBX_PROXY_TRUSTED_ADDR` / Smokescreen `--allow-address`), ikke
   som en brukerkommentert allowlistpost.
+- **Løst:** øvrige host-porter kan eksplisitt tillates via
+  `-H 8080 -H 9443` (CLI-flagg i run-code.sh/run-pentest.sh) —
+  lib/sandbox.sh vedlegger `host.containers.internal:<port>` til
+  `SBX_PROXY_TRUSTED`. Blir et port-for-port-runtime-unntak, aldri en
+  allowlistpost, og host-tjenesten må lytte på noe annet enn loopback.
 - Strømming mot modellserveren: proxy.py bufres/trunkerer HTTP-svar
   (kjent funn); plain-HTTP over proxy krever strømande proxy —
   verifiseres mot Smokescreen i punkt 3.
