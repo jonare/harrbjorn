@@ -2,8 +2,11 @@
 # run-code.sh — kodeagent-sandbox: dev-miljø + Claude Code CLI.
 #
 # Usage:
-#   ./run-code.sh -w <workdir> [-a host[:port]]... [-H port]... \
-#                 [-f extra-allowlist] [--rebuild] -- <cmd> [args...]
+#   harrbjorn code [-w <workdir>] [-a host[:port]]... [-H port]...
+#                  [-f extra-allowlist] [--rebuild] [--] <cmd> [args...]
+#   (equivalent to ./run-code.sh; <workdir> defaults to the current
+#   directory, and `--` is optional — the first non-flag argument
+#   starts the command)
 #
 #   Model config: hostens Claude-config (SBX_CLAUDE_CONFIG, default
 #   ~/claude.sh) injiseres som env-vars; loopback -> host.containers.internal.
@@ -19,11 +22,12 @@
 #   veien, og ikke en allowlistpost.
 #
 # Eksempler:
-#   ./run-code.sh -w ~/proj -- claude --dangerously-skip-permissions
-#   ./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen"
+#   harrbjorn code                          # interaktiv claude i cwd
+#   harrbjorn code claude -p "Refaktoriser auth-modulen"
 #   (containernens claude kjører med bypassPermissions som default — ingen
 #    --dangerously-skip-permissions-flagg nødvendig)
-#   ./run-code.sh -w ~/proj -- bash
+#   harrbjorn code bash                     # vanlig dev-bruk
+#   harrbjorn code -w ~/proj claude         # annen workdir enn cwd
 #
 # Isolasjonslag (rootless podman, ingen sudo; hvert holder selv hvis ett feiler):
 #   1. sandbox kjører kun på sesjonens internal-nett (ingen direkte utgang)
@@ -32,7 +36,7 @@
 #   4. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
 
 set -euo pipefail
-sbx_usage() { sed -n '2,32p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,36p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code

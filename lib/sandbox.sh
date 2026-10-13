@@ -113,19 +113,25 @@ sbx_main() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -w) WORKDIR="$2"; shift 2 ;;
-      -a) EXTRA_HOSTS+=("$2"); shift 2 ;;
-      -H) HOST_PORTS+=("$2"); shift 2 ;;
-      -f) EXTRA_ALLOWLIST="$2"; shift 2 ;;
+      -w) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
+          WORKDIR="$2"; shift 2 ;;
+      -a) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
+          EXTRA_HOSTS+=("$2"); shift 2 ;;
+      -H) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
+          HOST_PORTS+=("$2"); shift 2 ;;
+      -f) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
+          EXTRA_ALLOWLIST="$2"; shift 2 ;;
       --rebuild) REBUILD=1; shift ;;
       -h|--help) sbx_usage 0 ;;
       --) shift; break ;;
-      *) echo "error: unknown option: $1" >&2; sbx_usage 1 ;;
+      -*) echo "error: unknown option: $1" >&2; sbx_usage 1 ;;
+      *) break ;;  # first non-flag argument starts the command; `--` is optional
     esac
   done
-  [[ $# -gt 0 ]] || { echo "error: no command after --" >&2; sbx_usage 1; }
+  [[ $# -gt 0 ]] || { echo "error: no command" >&2; sbx_usage 1; }
   local CMD=("$@")
-  [[ -n "$WORKDIR" ]] || { echo "error: -w <workdir> is required" >&2; sbx_usage 1; }
+  # -w is optional: the workspace defaults to the current directory.
+  WORKDIR="${WORKDIR:-$PWD}"
   [[ -d "$WORKDIR" ]] || { echo "error: workdir $WORKDIR does not exist" >&2; exit 1; }
   local WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
 

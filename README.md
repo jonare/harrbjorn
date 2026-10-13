@@ -7,13 +7,13 @@
 
 Et rootless Podman-oppsett der agenter (Claude Code CLI) kan kjøre autonomt mot
 en bind-mounted workspace, uten å kunne skade hostsystemet. Ingen sudo noe
-sted — hele isolasjonen kjører i brukerens rootless netns/userns. To usecases,
-hver med sitt oppstartsscript og sitt bilde:
+sted — hele isolasjonen kjører i brukerens rootless netns/userns. Én CLI
+(`harrbjorn`), to usecases, hver med sitt oppstartsscript og sitt bilde:
 
-| Usecase | Wrapper | Bilde | Tooling |
-|---|---|---|---|
-| Kodeagent | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, åpen nettverksutgang som standard |
-| Sikkerhetstesting | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb; mål legges til med `-a` ved kjør |
+| Usecase | CLI | Wrapper | Bilde | Tooling |
+|---|---|---|---|---|
+| Kodeagent | `harrbjorn code` | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, åpen nettverksutgang som standard |
+| Sikkerhetstesting | `harrbjorn security` | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb; mål legges til med `-a` ved kjør |
 
 Isolasjonskjernen (per-sesjon nett, proxy, host-isolasjon via proxy-policy,
 model-injeksjon, agent-HOME) deles via `lib/sandbox.sh`; wrappers er tynne og
@@ -129,20 +129,36 @@ cp .env.example .env                        # valgfrie limit/overrides
 
 Krever bare Podman (rootless) + crun — standard på Fedora; ingen sudo, ingen
 daemon. Alt annet (bilder bygges ved behov, per-sesjon nettverk, proxy)
-settes opp automatisk av `run-code.sh` / `run-pentest.sh` — idempotent.
+settes opp automatisk av `harrbjorn` (resp. wrapperne) — idempotent.
+
+CLI-en krever ingen installasjon: kjør `./harrbjorn` i repo-rotten, eller
+symlink den inn i en mappe som allerede er i PATH (`~/.local/bin/harrbjorn`),
+eller legg repo-rotten i PATH. Autocomplete (bash) eval-eres i `~/.bashrc`:
+
+```bash
+eval "$(harrbjorn completion)"
+```
 
 ## Bruk
 
 ```bash
-./run-code.sh    -w <workdir> [--flagg] -- <kommando> [args...]
-./run-pentest.sh -w <workdir> [--flagg] -- <kommando> [args...]
+harrbjorn code <args>      # kodeagent-sandbox (run-code.sh)
+harrbjorn security <args>  # sikkerhetstest-sandbox (run-pentest.sh)
+```
+
+`<args>` går uendret til usecase-wrapperen; den første non-flag-argen starter
+kommandoen, så `--` er valgfri. Wrapperne kan også kjøres direkte:
+
+```bash
+./run-code.sh    [-w <workdir>] [--flagg] [--] <kommando> [args...]
+./run-pentest.sh [-w <workdir>] [--flagg] [--] <kommando> [args...]
 ```
 
 Flagg (identiske i begge):
 
 | Flag | Effekt |
 |---|---|
-| `-w DIR` | Workspace (bindmount til `/work`, rw). Obligatorisk. |
+| `-w DIR` | Workspace (bindmount til `/work`, rw). Default: gjeldende direktori. |
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). Bare relevant i allowlist-modus. |
 | `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream. Den eneste veien til hosten — se [Host-tjenester](#host-tjenester). |
 | `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). Bare relevant i allowlist-modus. |
@@ -163,31 +179,31 @@ Default: `code=1` (åpen), `pentest=0` (allowlist). Proxyen skrives opp per
 sesjon — wrapperen viser navnet (`sbx-<usecase>-<ts>-<pid>-proxy`) på
 start.
 
-Eksempler — kodeagent:
+Eksempler — kodeagent (kjører i gjeldende direktori; `-w` for annen workdir):
 
 ```bash
 # Interaktiv Claude Code-sesjon i et prosjekt
-./run-code.sh -w ~/proj -- claude
+cd ~/proj && harrbjorn code claude
 
 # Énkjørs-agenter
-./run-code.sh -w ~/proj -- claude -p "Refaktoriser auth-modulen"
+harrbjorn code -w ~/proj claude -p "Refaktoriser auth-modulen"
 
 # Vanlig dev-bruk
-./run-code.sh -w ~/proj -- bash
+harrbjorn code bash
 ```
 
 Eksempler — sikkerhetstesting (målene ligger IKKE i default-allowlisten,
 legges til med `-a` ved kjør):
 
 ```bash
-# agent-drevet pentest
-./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
-  -- claude -p "Portscan og test 192.168.50.10"
+# agent-drevet pentest (i målets workspace)
+harrbjorn security -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
+  claude -p "Portscan og test 192.168.50.10"
 
 # direkte verktøy (HTTP-vedkommende verktøy kun — se Begrensninger)
-./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 -- curl -sI http://192.168.50.10:8080/
-./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 \
-  -- sqlmap --proxy http://sbx-pentest-<ts>-<pid>-proxy:3128 -u "http://192.168.50.10:8080/admin" --batch
+harrbjorn security -w ~/pentest -a 192.168.50.10:8080 curl -sI http://192.168.50.10:8080/
+harrbjorn security -w ~/pentest -a 192.168.50.10:8080 \
+  sqlmap --proxy http://sbx-pentest-<ts>-<pid>-proxy:3128 -u "http://192.168.50.10:8080/admin" --batch
 ```
 
 Utgress-audit:
@@ -237,7 +253,7 @@ hostadresse, 169.254.1.2) og kun via proxyens **trusted-sett**:
 1. **Modellserveren** legges til automatisk: porten parsest fra
    modelconfigens `ANTHROPIC_BASE_URL` (se ovenfor).
 2. **Andre host-tjenester** (testinstanser på hosten) legges til eksplisitt,
-   port for port, med `-H`: `./run-code.sh -w ~/proj -H 8080 -H 9443 -- ...`.
+   port for port, med `-H`: `harrbjorn code -w ~/proj -H 8080 -H 9443 claude ...`.
    Hver port blir en trusted upstream for `host.containers.internal:<port>` —
    et eksplisitt, port-for-port-runtime-unntak, aldri en allowlistpost.
    Hosten er link-local, så alt-avvis-settet og DNS-rebinding-vernet avslår
@@ -271,6 +287,12 @@ Det er ingen iptables, ingen sudo og ingen sudoers-drop-in i dette oppsettet
 ## Self-test (end-til-end)
 
 ```bash
+# CLI-inngangen: workdir = cwd, ingen -w, ingen --
+mkdir -p /tmp/sbx-test && cd /tmp/sbx-test
+touch cwd-marker
+harrbjorn code sh -c 'test "$(pwd)" = /work && test -e /work/cwd-marker && rm /work/cwd-marker && echo CLI-CWD-OK'
+cd -
+
 mkdir -p /tmp/sbx-test
 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   set -x
