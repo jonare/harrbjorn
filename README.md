@@ -108,12 +108,18 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
    tmpfs over /tmp og /var/tmp, persistent agent-HOME
    (`.sandbox/agent-home/<usecase>/<workdir>` — nøkkelset på usecase + workdir,
    kun instanser i samme workdir OG usecase deler state;
-   Claude Code sitt onboarding/settings-state, pre-seedet ved hver kjør:
-   onboarding fullført, `/work`-trust-dialog acceptert, modelconfigens
-   API-key approvet, permission-mode satt til `bypassPermissions`
+   Claude Code sitt onboarding/settings-state, seedes ved hver kjør av
+   bildets init-steg (`code/sbx-init.sh`) INNE i containeren — aldri av en
+   hostprosess: mellom kjør eier agenten agent-HOME-katalogen og kan plante
+   symlenker der (f.eks. `~/.claude -> /work/...`), og en host-side seeder
+   ville fulgt dem og skrevet der lenken pekte; inne i containeren når
+   skrivene kun monteringer agenten allerede fullt kontrollerer.
+   Seeden setter onboarding fullført, `/work`-trust-dialog acceptert,
+   modelconfigens API-key approvet og permission-mode til `bypassPermissions`
    (containernens claude kjører altså uten `--dangerously-skip-permissions`-flagg;
    gjelder KUN denne user-level-configen i agent-HOME — hostens `~/.claude`
-   røres ikke) — så first-run-vizarden hoppes over helt), pids/memory/cpu-limit.
+   røres ikke), slik at first-run-vizarden ikke vises),
+   pids/memory/cpu-limit.
 
 ## Setup
 

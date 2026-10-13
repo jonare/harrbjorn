@@ -14,8 +14,8 @@ fra analysen. Kun lokal kjøring på Linux-laptop (Fedora).
 | Workspace-skriv gir kodekjøring på host (hooks, `.envrc` o.l.) | 5 |
 | Store HTTP-svar bufres og trunkeres i proxy | 3 |
 
-Utenfor scope (egen oppgave): symlink-angrepet mot host-seedingen av
-agent-HOME. Se «Relatert» nederst; ny design gjør fiksen enkel.
+Løst: symlink-angrepet mot host-seedingen av agent-HOME — seeding flyttet
+fra hosten til init-steg i containeren (`code/sbx-init.sh`). Se «Relatert».
 
 ---
 
@@ -216,9 +216,13 @@ fungerer ikke; bruk separate nettverk som under.
 
 ## Relatert (ikke del av 1-5)
 
-- Agent-HOME-seeding: flytt Python-seedingen fra hosten til et init-steg
-  inne i containeren (eller bruk `O_NOFOLLOW`/`lstat` og avvis symlenker),
-  slik at agenten ikke kan få hostprosessen til å skrive via symlenker.
+- **Løst:** Agent-HOME-seeding flyttet fra hosten til et init-steg inne i
+  containeren: `code/sbx-init.sh` som `ENTRYPOINT` i `harrbjorn/code`
+  (arves av `harrbjorn/pentest`); seedes fra `HOME`/`ANTHROPIC_API_KEY` i
+  containerens env, før `exec "$@"`. Hostprosessen rører kun
+  `mkdir -p`/`chmod` av selve AGENT_HOME-veien under `.sandbox/` (aldri
+  montert i containeren, så ingen agent-kjører kan plante lenker der) —
+  ingen host-skriver faller lenger i agentkontrollert katalog.
 - Agent-HOME per workspace i stedet for felles for alle sesjoner og begge
   usecases.
 - Hemmeligheter via `--env-file` (0600) eller `podman secret`, ikke `-e` på

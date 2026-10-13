@@ -44,6 +44,14 @@ ENV LANG=nb_NO.UTF-8
 # sandbox user has a stable name regardless of the base image's choice.
 RUN usermod -l agent -d /home/agent -m node
 
+# Init step: pre-seeds $HOME with Claude Code state before exec'ing the
+# command (see sbx-init.sh). Seeding happens inside the container, never on
+# the host: between runs the agent owns the agent-HOME bind mount and can
+# plant symlinks in it, which a host-side seeder would follow.
+COPY sbx-init.sh /usr/local/bin/sbx-init.sh
+RUN chmod 755 /usr/local/bin/sbx-init.sh
+
 WORKDIR /work
 USER agent
+ENTRYPOINT ["/usr/local/bin/sbx-init.sh"]
 CMD ["bash"]
