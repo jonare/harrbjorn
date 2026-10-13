@@ -60,20 +60,7 @@ CONNECT_TIMEOUT_SECONDS = 30
 
 log = logging.getLogger("sbx-proxy")
 
-# Config-level trusted upstreams: host -> port set (empty set = any port).
 SBX_PROXY_TRUSTED = os.environ.get("SBX_PROXY_TRUSTED", "")
-TRUSTED = {}
-for _entry in SBX_PROXY_TRUSTED.split(","):
-    _entry = _entry.strip()
-    if not _entry:
-        continue
-    _name, _, _p = _entry.rpartition(":")
-    try:
-        TRUSTED[_name.lower().rstrip(".")] = (
-            frozenset([int(_p)]) if _p else frozenset()
-        )
-    except ValueError:
-        log.warning("SBX_PROXY_TRUSTED: bad entry %r, skipping", _entry)
 
 # Reserved ranges a hostname entry must never resolve to (defeats
 # DNS-rebinding / "my domain points at the host" tricks).
@@ -185,6 +172,30 @@ def _merge_ports(existing, new):
     if not new:
         new = frozenset((80, 443))
     return existing | new
+
+
+# Config-level trusted upstreams: host -> port set (empty set = default
+# ports 80/443, per _port_allowed). Parsed here (not at the top of the
+# module) so entries can be merged with _merge_ports: the model-server port
+# and every -H port are all host.containers.internal, and same-host entries
+# must accumulate port sets instead of clobbering each other.
+TRUSTED = {}
+for _entry in SBX_PROXY_TRUSTED.split(","):
+    _entry = _entry.strip()
+    if not _entry:
+        continue
+    _name, _, _p = _entry.rpartition(":")
+    try:
+        name = _name.lower().rstrip(".")
+        ports = frozenset([int(_p)]) if _p else frozenset()
+        if name in TRUSTED:
+            TRUSTED[name] = _merge_ports(TRUSTED[name], ports)
+        else:
+            # First entry: keep the exact set — a single explicit port must
+            # not widen to the default 80/443.
+            TRUSTED[name] = ports
+    except ValueError:
+        log.warning("SBX_PROXY_TRUSTED: bad entry %r, skipping", _entry)
 
 
 def load_allowlist(path):
