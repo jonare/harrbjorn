@@ -20,6 +20,7 @@ api.github.com
 codeload.github.com
 raw.githubusercontent.com
 
-# --- Host services (bridge gateway 172.28.0.1) ---
-# The local model server entry (172.28.0.1:<port>) is added automatically by
-# the sandbox scripts, derived from the model config's ANTHROPIC_BASE_URL.
+# --- Host services ---
+# The local model server (host.containers.internal:<port>) is NOT listed
+# here: the sandbox scripts grant it to the proxy as a trusted upstream,
+# derived from the model config's ANTHROPIC_BASE_URL.

@@ -2,15 +2,21 @@
 # run-code.sh — kodeagent-sandbox: dev-miljø + Claude Code CLI.
 #
 # Usage:
-#   ./run-code.sh -w <workdir> [-a host[:port]]... [-f extra-allowlist] \
-#                 [--no-host-isolation] [--rebuild] -- <cmd> [args...]
+#   ./run-code.sh -w <workdir> [-a host[:port]]... [-H port]... \
+#                 [-f extra-allowlist] [--rebuild] -- <cmd> [args...]
 #
 #   Model config: hostens Claude-config (SBX_CLAUDE_CONFIG, default
-#   ~/claude.sh) injiseres som env-vars; loopback -> 172.28.0.1 (host-gw).
+#   ~/claude.sh) injiseres som env-vars; loopback -> host.containers.internal.
 #
 #   Nettverk: åpen utgang som standard (SBX_OPEN_NETWORK=1) — proxyen logger
 #   all trafikk, men håndhever ikke allowlisten. SBX_OPEN_NETWORK=0 (env/.env)
 #   gir klassisk allowlist-adgang (allowlist.code.default + -a/-f).
+#
+#   Host-tjenester (testinstanser på hosten): -H 8080 -H 9443
+#   tillater eksplisitt, port for port, nåing av hosten via
+#   http://host.containers.internal:<port>. Hosten er ellers alltid nektet
+#   (link-local, både i open- og allowlist-modus); flagget er den eneste
+#   veien, og ikke en allowlistpost.
 #
 # Eksempler:
 #   ./run-code.sh -w ~/proj -- claude --dangerously-skip-permissions
@@ -19,14 +25,14 @@
 #    --dangerously-skip-permissions-flagg nødvendig)
 #   ./run-code.sh -w ~/proj -- bash
 #
-# Isolasjonslag (hvert holder selv hvis ett feiler):
-#   1. sandbox kjører kun på --internal-nettverket (ingen direkte utgang)
+# Isolasjonslag (rootless podman, ingen sudo; hvert holder selv hvis ett feiler):
+#   1. sandbox kjører kun på sesjonens internal-nett (ingen direkte utgang)
 #   2. forward-proxy er eneste utgang; åpen som standard, audit-logg alltid
-#   3. host-iptables (sudo) blokkerer gateway-IP-holet i intern-bridgen
-#   4. container-hardening: read-only, cap-drop ALL, no-new-privileges, limits
+#   3. container-hardening: read-only, cap-drop ALL, no-new-privileges, limits
+#   4. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
 
 set -euo pipefail
-sbx_usage() { sed -n '2,26p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,32p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code

@@ -5,18 +5,19 @@
 
 ## Oppsett
 
-Et Docker-oppsett der agenter (Claude Code CLI) kan kjøre autonomt mot en
-bind-mounted workspace, uten å kunne skade hostsystemet. To usecases, hver
-med sitt oppstartsscript og sitt bilde:
+Et rootless Podman-oppsett der agenter (Claude Code CLI) kan kjøre autonomt mot
+en bind-mounted workspace, uten å kunne skade hostsystemet. Ingen sudo noe
+sted — hele isolasjonen kjører i brukerens rootless netns/userns. To usecases,
+hver med sitt oppstartsscript og sitt bilde:
 
 | Usecase | Wrapper | Bilde | Tooling |
 |---|---|---|---|
 | Kodeagent | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, åpen nettverksutgang som standard |
 | Sikkerhetstesting | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb; mål legges til med `-a` ved kjør |
 
-Isolasjonskjernen (nettverk, proxy, iptables, model-injeksjon, agent-HOME)
-deles via `lib/sandbox.sh`; wrappers er tynne og setter bare
-`SBX_USECASE`/`SBX_IMAGE`/`SBX_CONTEXT`/`SBX_ALLOWLIST_DEFAULT`.
+Isolasjonskjernen (per-sesjon nett, proxy, host-isolasjon via proxy-policy,
+model-injeksjon, agent-HOME) deles via `lib/sandbox.sh`; wrappers er tynne og
+setter bare `SBX_USECASE`/`SBX_IMAGE`/`SBX_CONTEXT`/`SBX_ALLOWLIST_DEFAULT`.
 
 ## Trusselmodell
 
@@ -29,8 +30,10 @@ Den innsperrede agenten skal:
     `SBX_OPEN_NETWORK=0` gir klassisk host(:port)-whitelist
   - **sikkerhetstesting**: kun allowlistede mål (legges til med `-a`,
     inkl. IP-literaler)
-- **ikke** nå hosten utover tillatne porter (`SBX_HOST_PORTS`)
-- **ikke** kunne skade hosten via filsystemet (read-only rootfs, unprivilegert bruker)
+- **ikke** nå hosten utover tillatne porter (modellserver-porten automatisk,
+  andre porter kun med eksplisitt `-H`)
+- **ikke** kunne skade hosten via filsystemet (read-only rootfs, unprivilegert
+  keep-id user-namespace)
 
 Model-backend:
 
@@ -39,14 +42,16 @@ Sandboxen rebruker **hostens egen Claude Code-modelconfig**
 `ANTHROPIC_*`/`CLAUDE_CODE_*`-env-vars — samme modell, effort, kontekstvindu
 og nøkkel som på hosten. Den eneste endringen er at en loopback-
 `ANTHROPIC_BASE_URL` (`localhost`/`127.0.0.1`) skrives om til
-bridge-gatewayen `172.28.0.1`, slik at containeren når hostens modellserver
-via det riktige grensesnittet. Configen injiseres som env-vars i containeren
-(standalone) — ingen fil monteres inn. Kun `export ...`-linjene leses, så
-filens kommentarer og avsluttende `claude`-kommando ignoreres.
+`host.containers.internal` (podmans pasta-hostadresse, 169.254.1.2), slik at
+containeren når hostens modellserver via det riktige grensesnittet. Configen
+injiseres som env-vars i containeren (standalone) — ingen fil monteres inn.
+Kun `export ...`-linjene leses, så filens kommentarer og avsluttende
+`claude`-kommando ignoreres.
 
-Porten i base-URL-en parsest ut og legges automatisk til i
-`SBX_HOST_PORTS` (iptables) og allowlisten (`172.28.0.1:<port>`), så bytter
-du port på hosten trenger bare config-fila å oppdateres.
+Porten i base-URL-en parsest ut og gjøres til en **trusted upstream** i
+proxyens policy (`SBX_PROXY_TRUSTED`) — et runtime-unntak som slår over
+alt-avvis-settet og DNS-rebinding-vernet, aldri en allowlistpost. Bytter du
+port på hosten, trenger bare config-fila å oppdateres.
 
 - **Sant Anthropic API**: endre hostconfigen (eller peke `SBX_CLAUDE_CONFIG`
   et annet sted / fjerne den og sette `ANTHROPIC_API_KEY` i `.env`);
@@ -57,56 +62,63 @@ krav, ikke et hull) — hold ikke noe annet hemmelig i workspace-direktivet.
 
 ## Arkitektur
 
+Per sesjon `S` (`S = sbx-<usecase>-<ts>-<pid>`):
+
 ```
 host
-└─ docker
-   ├─ sbx-internal  (bridge, --internal, 172.28.0.0/24 — ingen utgang)
-   ├─ sbx-egress    (bridge, 172.29.0.0/24)
-   ├─ sbx-proxy     (internal + egress; forward-proxy; allowlist eller
-   │                  åpen utgang per usecase, audit-logg alltid)
-   └─ sandbox       (code- eller pentest-sandbox; kun internal;
-                     HTTP(S)_PROXY→sbx-proxy:3128, --rm)
+└─ podman (rootless, ingen sudo)
+   ├─ sbx-<S>-int    podman network --internal (ingen utgang, ingen host-route)
+   ├─ sbx-<S>-proxy  pasta-standardnett (reell egress + host.containers.internal)
+   │                 + sbx-<S>-int; forward-proxy :3128; allowlist eller åpen
+   │                 utgang per sesjon; audit-logg alltid; per-sesjon
+   │                 allowlist + resolv.conf bind-montert
+   └─ sbx-<S>        sandbox (code- eller pentest); kun sbx-<S>-int;
+                     HTTP(S)_PROXY→proxy:3128; --rm; keep-id uid 1000
 ```
 
-To bilder, én del: `harrbjorn/code:latest` og `harrbjorn/pentest:latest`
-kjører begge på `sbx-internal` og deler én `sbx-proxy` og nettverkene.
-Allowlisten og utgangsmoden (`SBX_OPEN_NETWORK`) er usecase-spesifikke
-kjøreparametere, så bytter du usecase endres hashen og proxyen restartes
-automatisk (label-hash-sammenligning). Containerenavnet viser usecase:
-`sbx-code-<ts>` / `sbx-pentest-<ts>`.
+Hver sesjon får sitt eget nettverk og sin egen proxy, så samtidige sesjoner
+(code + pentest) har hver sin policy — ingen delt proxy, ingen
+label-hash-sammenligning. Ressursene fjernes automatisk ved avslutning
+(EXIT-trapp), og foreldreløse `sbx-*`-containere/nettverk fra avbrutte kjør
+ryddes ved neste oppstart.
 
 Isolasjonslag — hvert holder selv hvis ett feiler:
 
-1. **Internal-nettverk** — kjernepolitikk: agenten kan fysisk ikke åpne
-   en rå socket til internett. Verktøy som ignorerer proxy-env-vars feiler trygt.
+1. **Per-sesjon internal-nettverk** (rootless netavark) — kjernepolitikk:
+   agenten kan fysisk ikke åpne en rå socket til internett. Nettverket lever
+   i brukerens rootless netns, og gatewayen er ikke hostens nettverksstack —
+   verken gateway-IP-hulet fra docker-æraen eller noen iptables-kjede trengs
+   (se [Host-isolasjon](#host-isolasjon)). Verktøy som ignorerer
+   proxy-env-vars feiler trygt.
 2. **Proxy-utgang** — eneste utgang; kodeagent har åpen utgang som standard
    (`SBX_OPEN_NETWORK=1`), sikkerhetstesting håndhever host(:port)-allowlisten.
    Åpen modus: permanent-avvis-settet (loopback, 0/8, 169.254/16) og
    DNS-rebinding-vern gjelder fortsatt, og all trafikk logges.
-   CONNECT-tunnel for HTTPS (ingen MITM), logger ALLOWED/DENIED til stdout.
-3. **Host-iptables** (sudo, idempotent) — blockerer gateway-IP-holet: selv et
-   `--internal`-nettverk slupper gateway-IP (172.28.0.1 = hosten) gjennom til
-   containeren. Kun rettet mot sandbox-bridgen. Enkelte tcp-porter på hosten
-   kan slippes gjennom med `SBX_HOST_PORTS` (se [Host-tjenester](#host-tjenester)).
+   CONNECT-tunnel for HTTPS (ingen MITM), logger `ALLOWED`/`DENIED` til stdout.
+3. **Hosten er link-local** — `host.containers.internal` (169.254.1.2) ligger
+   i proxyens permanent-avvis-sett, også for IP-literaler. Hosten er altså
+   aldri nåbar via allowlist eller åpen modus; trusted-settet (modellport +
+   `-H`) er den eneste veien (se [Host-tjenester](#host-tjenester)).
 4. **Container-hardening** — `--read-only`, `--cap-drop ALL`,
-   `--security-opt no-new-privileges`, uid 1000, tmpfs over /tmp og /var/tmp,
-   persistent agent-HOME (`.sandbox/agent-home` — Claude Code sitt
-   onboarding/settings-state, pre-seedet ved hver kjør: onboarding fullført,
-   `/work`-trust-dialog acceptert, modelconfigens API-key approvet,
-   permission-mode satt til `bypassPermissions` (containernens claude kjører
-   altså uten `--dangerously-skip-permissions`-flagg; gjelder KUN denne
-   user-level-configen i agent-HOME — hostens `~/.claude` røres ikke) — så
-   first-run-vizarden hoppes over helt), pids/memory/cpu-limit.
+   `--security-opt no-new-privileges`, keep-id user-namespace (containerens
+   uid 1000 = hostens uid 1000, så bindmounter eies av hostbrukeren utenfor),
+   tmpfs over /tmp og /var/tmp, persistent agent-HOME (`.sandbox/agent-home` —
+   Claude Code sitt onboarding/settings-state, pre-seedet ved hver kjør:
+   onboarding fullført, `/work`-trust-dialog acceptert, modelconfigens
+   API-key approvet, permission-mode satt til `bypassPermissions`
+   (containernens claude kjører altså uten `--dangerously-skip-permissions`-flagg;
+   gjelder KUN denne user-level-configen i agent-HOME — hostens `~/.claude`
+   røres ikke) — så first-run-vizarden hoppes over helt), pids/memory/cpu-limit.
 
 ## Setup
 
 ```bash
-sudo systemctl enable --now docker          # første gang
 cp .env.example .env                        # valgfrie limit/overrides
 ```
 
-Alt annet (bilder, nettverk, proxy, iptables) settes opp automatisk av
-`run-code.sh` / `run-pentest.sh` — idempotent.
+Krever bare Podman (rootless) + crun — standard på Fedora; ingen sudo, ingen
+daemon. Alt annet (bilder bygges ved behov, per-sesjon nettverk, proxy)
+settes opp automatisk av `run-code.sh` / `run-pentest.sh` — idempotent.
 
 ## Bruk
 
@@ -121,19 +133,24 @@ Flagg (identiske i begge):
 |---|---|
 | `-w DIR` | Workspace (bindmount til `/work`, rw). Obligatorisk. |
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). Bare relevant i allowlist-modus. |
+| `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream. Den eneste veien til hosten — se [Host-tjenester](#host-tjenester). |
 | `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). Bare relevant i allowlist-modus. |
-| `--no-host-isolation` | Hopp over sudo-iptables-laget (default: på). |
-| `--rebuild` | Bygg bilde + proxy på nytt (Claude Code-låses ved build; se Begrensninger). |
+| `--rebuild` | Bygg bilder + proxy på nytt (Claude Code-låses ved build; se Begrensninger). |
 
-Miljøvariabel (`env`/`.env`, vinner over wrapper-default):
+Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
 
 | Variable | Verdi | Effekt |
 |---|---|---|
 | `SBX_OPEN_NETWORK` | `1` | Åpen utgang: proxyen logger all trafikk, men slår allowlisten. |
 | | `0` | Allowlisten håndheves (default-allowlisten + `-a`/`-f`). |
+| `SBX_LOCALE` | `nb_NO.UTF-8` | Terminal-lokal (injectert som `LANG`). Norsk tastatur å/ø/æ i interaktiv modus. Default. |
+| | `en_US.UTF-8` | Nøytralt UTF-8-alternativ. Må være generert i bildet (se `code/Dockerfile`). |
+| `SBX_MEMORY` / `SBX_CPUS` / `SBX_PIDS` | f.eks. `4g` / `2` / `1024` | Ressursgrenser for sandboxen (wrapper-defaults i `.env.example`). |
+| `SBX_CLAUDE_CONFIG` | sti | Modelconfig (default `~/claude.sh`). |
 
-Default: `code=1` (åpen), `pentest=0` (allowlist). Bytter modus gir ny
-hash → proxyen restartes automatisk.
+Default: `code=1` (åpen), `pentest=0` (allowlist). Proxyen skrives opp per
+sesjon — wrapperen viser navnet (`sbx-<usecase>-<ts>-<pid>-proxy`) på
+start.
 
 Eksempler — kodeagent:
 
@@ -159,15 +176,15 @@ legges til med `-a` ved kjør):
 # direkte verktøy (HTTP-vedkommende verktøy kun — se Begrensninger)
 ./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 -- curl -sI http://192.168.50.10:8080/
 ./run-pentest.sh -w ~/pentest -a 192.168.50.10:8080 \
-  -- sqlmap --proxy http://sbx-proxy:3128 -u "http://192.168.50.10:8080/admin" --batch
+  -- sqlmap --proxy http://sbx-pentest-<ts>-<pid>-proxy:3128 -u "http://192.168.50.10:8080/admin" --batch
 ```
 
-Utgress-audit (pentest-bruk):
+Utgress-audit:
 
 ```bash
-docker logs -f sbx-proxy
-# 2026-01-01 12:00:00,000 client=172.28.0.2 method=CONNECT target=192.168.50.10:443 action=ALLOWED
-# 2026-01-01 12:00:01,000 client=172.28.0.2 method=CONNECT target=example.com:443 action=DENIED reason=not in allowlist
+podman logs -f sbx-<usecase>-<ts>-<pid>-proxy     # navnet skrives ut av wrapperen
+# 2026-01-01 12:00:00,000 client=<sandbox-ip> method=CONNECT target=192.168.50.10:443 action=ALLOWED
+# 2026-01-01 12:00:01,000 client=<sandbox-ip> method=CONNECT target=example.com:443 action=DENIED reason=not in allowlist
 ```
 
 ## Allowlist-format
@@ -179,88 +196,66 @@ docker logs -f sbx-proxy
 - `*.example.com` → subdomene-vildekart
 - `10.1.2.3[:port]` → IP-literal (pentest-mål; private ranges tillatt)
 
-Två default-filer, én per usecase:
+To default-filer, én per usecase:
 
 - `allowlist.code.default` — Claude Code-hosts + dev/PM-hosts (npm, pypi,
   github, apt). Brukes bare når kodeagent kjører med `SBX_OPEN_NETWORK=0`
   (default er åpen utgang).
 - `allowlist.pentest.default` — kun Claude Code/LLM-hostene (bildet er
-  prebygd); pentest-mål legges alltid til med `-a`/-f ved kjør.
+  prebygd); pentest-mål legges alltid til med `-a`/`-f` ved kjør.
 
-`-a` og `-f` legges til ved kjør. Proxyen restartes automatisk når
-allowlisten endrer seg (label-hash-sammenligning); ellers gjenbrukes den.
+`-a` og `-f` slås sammen med default-fila til en per-sesjon-allowlisten
+(`.sandbox/allowlist-<S>.txt`), så samtidige sesjoner ikke deler en fil.
 
 DNS-rebinding-vern: for hostname-oppføringer resolveres navnet før kobling,
 og koblingen avslås hvis noen av adressene ligger i reserverte range
-(10/8, 172.16/12, 192.168/16, 127/8, 169.254/16, fc00::/7, fe80::/10
-samt de to sbx-subnettene) — et hostname kan aldri peke mot disse.
-0/8, 127/8 og 169.254/16 avvises alltid, også for IP-literal-oppføringer.
-De to sbx-subnettene er reserverte kun for hostnames: eksplicitte
-IP-literaler (`172.28.0.1:<port>`) tillates, og det er inngangen til
-host-tjenester (se nedenfor).
+(10/8, 172.16/12, 192.168/16, 0/8, 127/8, 169.254/16, fc00::/7, fe80::/10,
+::1/128, ::/128 samt de legacy sbx-subnettene 172.28.0.0/24 + 172.29.0.0/24) —
+et hostname kan aldri peke mot disse. 0/8, 127/8, 169.254/16 (og ::1, ::)
+avvises alltid, også for IP-literal-oppføringer. Det innebærer at
+`host.containers.internal` (169.254.1.2, link-local) aldri kan slippes
+gjennom som allowlistpost — host-tjenester kun via trusted-settet
+(nedenfor).
 
 ## Host-tjenester
 
 Sandboxen kan nå spesifikke tjenester på selve hosten (her: OpenAI-kompatibel
-modellserver, port parsest fra modelconfigens base URL). To lag må begge
-slippe gjennom:
+modellserver) — men kun via `host.containers.internal` (podmans pasta-
+hostadresse, 169.254.1.2) og kun via proxyens **trusted-sett**:
 
-1. **iptables** (host-bridgen): `SBX_HOST_PORTS` legger til ACCEPT-regel for
-   hver `tcp/<port>` i isolasjonskjeden, før DROP. Modellserver-porten legges
-   til automatisk; andre tjenester legges til i `.env` (f.eks.
-   `SBX_HOST_PORTS=8000,11434`).
-2. **Allowlist**: `172.28.0.1:<port>` (bridge-gateway = hosten) legges
-   automatisk til for modellserveren; andre host-tjenester må påsies med
-   `-a 172.28.0.1:<port>` eller `-f`. Proxyen aksepterer IP-literaler kun
-   dersom de er eksplisitt tillatt. Hostname-oppføringer kan aldri
-   reserveres til 172.28.0.0/24 (DNS-rebinding-vern), så kun den
-   eksplicitte IP-inngangen når hosten.
+1. **Modellserveren** legges til automatisk: porten parsest fra
+   modelconfigens `ANTHROPIC_BASE_URL` (se ovenfor).
+2. **Andre host-tjenester** (testinstanser på hosten) legges til eksplisitt,
+   port for port, med `-H`: `./run-code.sh -w ~/proj -H 8080 -H 9443 -- ...`.
+   Hver port blir en trusted upstream for `host.containers.internal:<port>` —
+   et eksplisitt, port-for-port-runtime-unntak, aldri en allowlistpost.
+   Hosten er link-local, så alt-avvis-settet og DNS-rebinding-vernet avslår
+   den uansett hva allowlisten (eller open-modus) sier: `-H` er den eneste
+   veien, i begge moduser.
 
-Merk: services på hosten må lytte på et grensesnitt utover loopback
+Merk: tjenester på hosten må lytte på et grensesnitt utover loopback
 (f.eks. `0.0.0.0` eller LAN-IP), ikke bare `127.0.0.1`.
 
 ```bash
 # fra sandboxen:
-curl http://172.28.0.1:8000/v1/models          # OK
-curl http://172.28.0.1:22/                     # 403 (ikke i allowlist)
-python3 -c "import socket; socket.create_connection(('172.28.0.1', 5432), 5)"
-# ConnectionRefused/blocked — rått TCP til ikke-tillatt port (iptables DROP)
+curl http://host.containers.internal:8000/v1/models   # OK (modellserver, auto-trusted)
+curl --max-time 5 http://host.containers.internal:22/ # 502 (link-local, aldri i allowlist)
 ```
 
-## Host-isolasjon (sudo-iptables)
+## Host-isolasjon
 
-På som standard (skipp: `--no-host-isolation` eller `HOST_ISOLATION=0` i `.env`).
-Påvirker kun INPUT-kjeden for sandbox-bridgen; proxy-egress-nettverket
-(172.29.0.0/24) er ikke berørt. Reglene (idempotent, ledd `SBX-ISOLATE`):
+Docker-oppsettet behøvde en sudo-iptables-kjede mot gateway-IP-hulet til
+`--internal`-bridgen (172.28.0.1 = hosten). Under rootless Podman er det
+hullet borte: per-sesjons internal-nettverk lever i brukerens rootless
+netns, og gatewayen er ikke hostens nettverksstack. Fra sandboxen er
+hostadressen (169.254.1.2) verken løselig eller rutebar
+(`Network is unreachable`) — hosten nås aldri direkte, med eller uten
+proxy-env-vars. Den eneste veien til hosten er proxyens trusted-sett
+(se [Host-tjenester](#host-tjenester)).
 
-```
--i br-<sbx-internal> :
-  ESTABLISHED,RELATED ACCEPT
-  NEW udp/tcp:53 ACCEPT        # embedded-DNS fra containeren
-  NEW tcp:<SBX_HOST_PORTS> ACCEPT   # f.eks. hostens modellserver :8000
-  ellers DROP
-```
-
-Kjeden rebuildes fra bunnen ved hver kjør, så portsettet følger alltid
-`SBX_HOST_PORTS`.
-
-### Automatisk installasjon (sudoers-drop-in)
-
-På hosts uten passordfritt sudo gir `etc/harrbjorn-sbx.sudoers` wrapperen
-NOPASSWD-tilgang til akkurat de iptables-kommandoen wrapperen selv kjører
-(kun SBX-ISOLATE-kjeden, kun mot sandbox-bridgen) — så laget installerer
-automatisk ved hver kjør:
-
-```bash
-sed "s/#USER#/$(id -un)/" etc/harrbjorn-sbx.sudoers \
-  | sudo tee /etc/sudoers.d/harrbjorn-sbx >/dev/null
-sudo chmod 0440 /etc/sudoers.d/harrbjorn-sbx
-sudo visudo -cf /etc/sudoers.d/harrbjorn-sbx     # må si "parsed OK"
-```
-
-Filen må ligge uten prikk i navnet, ellers ignorerer sudo den. Sjekk
-`command -v iptables` først — hvis den bor andre stede enn
-`/usr/bin/iptables`, juster pathen i drop-in-fila før install.
+Det er ingen iptables, ingen sudo og ingen sudoers-drop-in i dette oppsettet
+(`etc/harrbjorn-sbx.sudoers`, `--no-host-isolation`/`HOST_ISOLATION` og
+`SBX_HOST_PORTS` er fjernet).
 
 ## Self-test (end-til-end)
 
@@ -268,22 +263,32 @@ Filen må ligge uten prikk i navnet, ellers ignorerer sudo den. Sjekk
 mkdir -p /tmp/sbx-test
 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   set -x
-  curl -sI https://api.anthropic.com | head -1         # via proxy → OK
-  curl -sI https://example.com | head -1               # → OK (åpen utgang som standard)
-  curl -s --max-time 5 http://172.28.0.1/ || true      # host-gw port 80 → iptables DROP (timeout) eller 502
-  curl -s --max-time 5 http://172.28.0.1:8000/ || true # host-modellserver → OK (SBX_HOST_PORTS)
-  echo x > /etc/test || true                           # → Read-only file system
-  echo x > /work/test && cat /work/test                # OK, eies av uid 1000 på hosten
+  curl -sI https://api.anthropic.com | head -1                 # via proxy → OK
+  curl -sI https://example.com | head -1                       # → OK (åpen utgang som standard)
+  curl -s --max-time 5 http://host.containers.internal/ || true      # host port 80 → 502 (alt-avvis)
+  curl -s --max-time 5 http://host.containers.internal:8000/ || true # modellserver → OK (auto-trusted)
+  curl -s --max-time 5 "http://[::ffff:127.0.0.1]/" || true     # loopback → 502 (alt-avvis)
+  echo x > /etc/test || true                            # → Read-only file system
+  echo x > /work/test && stat -c "%U" /work/test         # OK, eies av hostbrukeren (keep-id)
 '
-docker logs sbx-proxy | tail                             # ALLOWED-linjer (logges også i åpen modus)
+podman logs "$(podman ps --filter name=sbx- --format '{{.Names}}' | grep -m1 proxy)" | tail
+# ... target=api.anthropic.com:443 action=ALLOWED
+# ... target=host.containers.internal:80 action=DENIED reason=...
 
-# Allowlist-modus for kodeagent (proxy restartes: ny hash — annen modus):
-SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- sh -c '
-  curl -sI https://api.anthropic.com | head -1           # → OK (i allowlist.code.default)
-  curl -sI https://example.com | head -1                 # → 403 (avvist)
+# -H: eksplisitt host-port (annen port enn modellserveren)
+./run-code.sh -w /tmp/sbx-test -H 9443 -- sh -c '
+  curl -s --max-time 5 http://host.containers.internal:9443/ || true   # OK hvis hosten lytter
+  curl -s --max-time 5 http://host.containers.internal:8080/ || true   # 502 (ikke -H-et)
 '
-SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- true # proxy gjenbrukes (hash-match i allowlist-modus)
-claude -p "Svar bare: OK"                                  # agent kjører via proxy
+
+# Allowlist-modus for kodeagent
+SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- sh -c '
+  curl -sI https://api.anthropic.com | head -1   # → OK (i allowlist.code.default)
+  curl -sI https://example.com | head -1         # → avvises (ikke i allowlisten)
+'
+
+# Agent kjører via proxy
+./run-code.sh -w /tmp/sbx-test -- claude -p "Svar bare: OK"
 # (containernens claude kjører med bypassPermissions som default — se
 # «Container-hardening»; ingen --dangerously-skip-permissions nødvendig)
 ```
@@ -292,50 +297,55 @@ Pentest-variant (mål i allowlisten via `-a`, dev-hosts skal være borte):
 
 ```bash
 ./run-pentest.sh -w /tmp/sbx-test -a example.com -- sh -c '
-  curl -sI https://example.com | head -1          # → OK (-a tillatt)
-  curl -sI https://pypi.org | head -1             # → 403 (dev-hosts borte i pentest-default)
+  curl -sI https://example.com | head -1   # → OK (-a tillatt)
+  curl -sI https://pypi.org | head -1      # → avvises (dev-hosts borte i pentest-default)
+  curl -s --max-time 5 http://10.0.0.1/ || true   # → 502 (RFC1918-mål uten -a)
 '
-docker logs sbx-proxy | tail
-./run-code.sh -w /tmp/sbx-test -- true            # cross-usecase: proxy restart (ny hash)
+podman logs "$(podman ps --filter name=sbx- --format '{{.Names}}' | grep -m1 proxy)" | tail
 ```
 
 ## Begrensninger
 
-- Whitelist-håndhevingen ligger i proxy-prosessen. Mitigering: ~450 linjer
-  kun-stdlib Python, read-only, uten privilegier, ingen publiserterte porter,
-  kun nåbar fra sandbox-nettverket. Kjernesiden («kun proxy kan nås») er
-  nettverksarkitekturens garant.
+- Allowlist-håndhevingen ligger i proxy-prosessen. Mitigering: ~450 linjer
+  kun-stdlib Python, read-only, uprivilegert (uid 65534 i containeren), ingen
+  publiserte porter, kun nåbar fra sesjonens internal-nettverk. Kjernesiden
+  («kun proxy kan nås») er nettverksarkitekturens garant.
 - Utgang er **proxy-kun**, ikke «proxy-fremst»: rå TCP uten proxy
   feiler trygt (ingen route).
 - Åpen utgang (`SBX_OPEN_NETWORK=1`) er et bevisst default for kodeagenten:
   all trafikk logges fortsatt, permanent-avvis-settet (loopback, 0/8,
-  169.254/16), DNS-rebinding-vern, host-iptables og container-hardening
-  holder likevel. `SBX_OPEN_NETWORK=0` gir klassisk allowlist-utgang.
+  169.254/16), DNS-rebinding-vern og container-hardening holder likevel.
+  `SBX_OPEN_NETWORK=0` gir klassisk allowlist-utgang.
 - Proxy-utgang betyr at **HTTP-vedkommende verktøy** i pentest-sandboxen er
   de som når målene: curl, python, git m.fl. bruker
   `HTTP(S)_PROXY`-env-vars automatisk. **sqlmap** må få proxyen eksplisitt:
-  `--proxy http://sbx-proxy:3128`. **nmap/hydra** (rått socket) når **ikke**
+  `--proxy http://sbx-pentest-<ts>-<pid>-proxy:3128` (navnet skrives ut av
+  wrapperen). **nmap/hydra** (rått socket) når **ikke**
   målene i denne arkitekturen — sikkerhetstesting er agent-/HTTP-drevet.
-- To bilder; hver wrapper bygger sin egen (`--rebuild`). Det gamle
-  `harrbjorn/sandbox:latest` kan prunes.
+- Tre bilder: `harrbjorn/code:latest`, `harrbjorn/pentest:latest` (bygges
+  `FROM` code, så code bygges alltid først) og `harrbjorn/sbx-proxy:latest`.
+  Bildene bygges automatisk ved første kjør og med `--rebuild`.
 - Claude Code-versjonen låses ved bilde-build (auto-update er slått av);
-  gjelder begge bildene — bygg på nytt med `--rebuild` for oppdateringer.
-- Fast uid/gid 1000 samsvarer med denne hosten. Bindmounter fra andre
-  uids: juster `--user` og tmpfs-`uid=`/`gid=` i `lib/sandbox.sh`.
-- `.sandbox/` og `.env` er git-ignoreret (allowlist-sammensmeltning +
-  agent-HOME + nøkkel).
+  gjelder begge sandbox-bildene — bygg på nytt med `--rebuild` for
+  oppdateringer.
+- keep-id user-namespace: containerens uid 1000 = hostens uid 1000, så
+  workspace-filer eies av hostbrukeren utenfor. Kjøres hostbrukeren under
+  et annet uid, juster `--userns=keep-id` og `--user` i `lib/sandbox.sh`.
+  (tmpfs-monter slipper `uid=`/`gid=`-oppsjørs — rootless
+  podman avviser dem i det hele tatt.)
+- Per-sesjonstate under `.sandbox/`: sammensmeltet allowlisten, per-sesjons
+  proxy `resolv.conf`, agent-HOME. `.env` (nøkler) er git-ignoreret.
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter.
 
 ## Fjerne (hvis du sletter oppsettet helt)
 
+Wrapperens egen opprydding fjerner sesjonens proxy + nettverk ved avslutning
+og foreldreløse `sbx-*`-ressurser ved neste oppstart. For full fjerning:
+
 ```bash
-sudo iptables -D INPUT -i br-<id12> -j SBX-ISOLATE   # br-<id12> fra:
-docker network inspect -f '{{.Id}}' sbx-internal
-sudo iptables -F SBX-ISOLATE && sudo iptables -X SBX-ISOLATE
-sudo docker rm -f sbx-proxy
-sudo docker network rm sbx-internal sbx-egress
-docker rmi harrbjorn/code:latest harrbjorn/pentest:latest harrbjorn/sbx-proxy:latest
-sudo rm /etc/sudoers.d/harrbjorn-sbx   # hvis sudoers-drop-inen er installert
+podman rm -f $(podman ps -a --filter name=sbx- --format '{{.Names}}' 2>/dev/null)
+podman network ls --format '{{.Name}}' | grep -E '^sbx-.*-int$' | xargs -r -n1 podman network rm
+podman rmi harrbjorn/code:latest harrbjorn/pentest:latest harrbjorn/sbx-proxy:latest
 rm -rf .sandbox
 ```

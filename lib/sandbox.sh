@@ -11,6 +11,10 @@
 #                          0 = allowlisten håndheves (pentest)
 # Wrapperen definerer i tillegg sbx_usage() som skriver sin egen hjelpetekst
 # og avslutter med gitt exit-kode.
+#
+# Runtime: rootless Podman, --userns=keep-id, per-sesjon nett (podman network
+# --internal) med per-sesjon proxy som eneste utgang. Ingen sudo: hosten
+# berøres aldri (nattverks-isolasjon kjører i nettverket, ikke i iptables).
 
 set -euo pipefail
 
@@ -25,31 +29,94 @@ SBX_CONTEXT="${SBX_CONTEXT:-code}"
 SBX_ALLOWLIST_DEFAULT="${SBX_ALLOWLIST_DEFAULT:-allowlist.code.default}"
 SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
 
-image_exists() { $DOCKER image inspect "$1" >/dev/null 2>&1; }
+# Per-sesjon ressurser (globale slik at EXIT-trappen kan rømme dem).
+PROXY_NAME=""
+NET_NAME=""
+RESOLV_CONF=""
 
-proxy_running() {
-  $DOCKER inspect -f '{{.State.Running}}' sbx-proxy 2>/dev/null | grep -q true
+sbx_cleanup() {
+  $PODMAN rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
+  $PODMAN network rm "$NET_NAME" >/dev/null 2>&1 || true
+  rm -f "$RESOLV_CONF"
 }
-proxy_hash() {
-  $DOCKER inspect -f '{{ index .Config.Labels "sbx.allowlist.hash" }}' sbx-proxy 2>/dev/null
+
+# Hent tilbake ressurser fra avbrutte kjør: døde sbx-* containere og ubrukte
+# sbx-*-int nettverk. Rende containere er alltid i live-sesjoner — røres ikke.
+sbx_reap_orphans() {
+  local c running n
+  for c in $($PODMAN ps -a --filter 'name=sbx-' --format '{{.Names}}' 2>/dev/null); do
+    running="$($PODMAN inspect -f '{{.State.Running}}' "$c" 2>/dev/null || echo false)"
+    [[ "$running" == "true" ]] && continue
+    echo ">> cleanup: removing orphan container $c"
+    $PODMAN rm -f "$c" >/dev/null 2>&1 || true
+  done
+  for n in $($PODMAN network ls --format '{{.Name}}' 2>/dev/null | grep -E '^sbx-.*-int$' || true); do
+    $PODMAN network rm "$n" >/dev/null 2>&1 || true
+  done
+  # Stale per-session proxy resolv.conf files (crashed/aborted sessions).
+  # Age-gated: a session under an hour may still be between writing the
+  # file and mounting it; a live older session keeps its mount alive
+  # through the underlying inode either way.
+  find "$STATE_DIR" -maxdepth 1 \
+    \( -name 'resolv-*.conf' -o -name 'allowlist-*.txt' \) -mmin +60 -delete \
+    >/dev/null 2>&1 || true
 }
-proxy_image_id() {
-  $DOCKER inspect -f '{{.Image}}' sbx-proxy 2>/dev/null
+
+image_exists() { $PODMAN image inspect "$1" >/dev/null 2>&1; }
+
+# Print the host's upstream DNS servers, one per line, in system order.
+# The proxy needs these as its only nameservers (not the loopback stubs in
+# /etc/resolv.conf, not the internal net's aardvark). Stub/loopback
+# addresses are filtered at every layer.
+sbx_uplink_dns() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, subprocess, sys
+try:
+    data = json.loads(subprocess.run(
+        ["resolvectl", "status", "--json=short"],
+        capture_output=True, text=True, timeout=5).stdout)
+except Exception:
+    sys.exit(1)
+seen = set()
+def emit(a):
+    if a and a not in seen and not a.startswith("127.") and a != "::1":
+        seen.add(a)
+        print(a)
+if data and isinstance(data[0], dict):
+    emit(data[0].get("currentServer", {}).get("addressString"))
+for link in data:
+    if isinstance(link, dict):
+        for s in link.get("servers", []):
+            emit(s.get("addressString"))
+' 2>/dev/null && return 0
+  fi
+  # Fallbacks: human-readable resolvectl, then plain /etc/resolv.conf.
+  local out
+  out="$(resolvectl status 2>/dev/null \
+    | sed -n 's/^[[:space:]]*DNS Servers:[[:space:]]*//p')"
+  if [[ -n "$out" ]]; then
+    echo "$out" | tr ' ' '\n' | grep -vE '^(127\.|::1$)' && return 0
+  fi
+  out="$(sed -n 's/^[[:space:]]*nameserver[[:space:]]*//p' /etc/resolv.conf 2>/dev/null)"
+  if [[ -n "$out" ]]; then
+    echo "$out" | tr ' ' '\n' | grep -vE '^(127\.|::1$)' && return 0
+  fi
+  return 1
 }
-image_id() { $DOCKER image inspect -f '{{.Id}}' "$1" 2>/dev/null; }
 
 sbx_main() {
   local WORKDIR="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
-  local HOST_ISOLATION=1 HOST_ISOLATION_SET=0 REBUILD=0
-  local T CONFIG_ENV=() CFG_GATEWAY_ENTRY="" MERGED HASH BRIDGE NET_ID
-  local AGENT_HOME
+  local HOST_PORTS=()
+  local REBUILD=0 T CONFIG_ENV=() MERGED
+  local S SBX_NAME PROXY_TRUSTED=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -w) WORKDIR="$2"; shift 2 ;;
       -a) EXTRA_HOSTS+=("$2"); shift 2 ;;
+      -H) HOST_PORTS+=("$2"); shift 2 ;;
       -f) EXTRA_ALLOWLIST="$2"; shift 2 ;;
-      --no-host-isolation) HOST_ISOLATION=0; HOST_ISOLATION_SET=1; shift ;;
       --rebuild) REBUILD=1; shift ;;
       -h|--help) sbx_usage 0 ;;
       --) shift; break ;;
@@ -68,26 +135,28 @@ sbx_main() {
   if [[ -f "$SCRIPT_DIR/.env" ]]; then
     set -a; source "$SCRIPT_DIR/.env"; set +a
   fi
-  # .env is sourced above and may set HOST_ISOLATION=1; an explicit
-  # --no-host-isolation flag always wins.
-  if [[ "$HOST_ISOLATION_SET" -eq 1 ]]; then
-    HOST_ISOLATION=0
-  else
-    HOST_ISOLATION="${HOST_ISOLATION:-1}"
-  fi
   local SBX_MEMORY="${SBX_MEMORY:-4g}"
   local SBX_CPUS="${SBX_CPUS:-2}"
   local SBX_PIDS="${SBX_PIDS:-1024}"
+  # Terminal locale, injected as -e LANG so the host keyboard's multi-byte
+  # UTF-8 (å/ø/æ) works in interactive mode (the image defaults to the same).
+  # Must be a locale the image generated: nb_NO.UTF-8 (default) / en_US.UTF-8.
+  # .env wins; the value is not re-derived from the host on purpose (a C host
+  # would silently re-break it).
+  local SBX_LOCALE="${SBX_LOCALE:-nb_NO.UTF-8}"
   # .env (sourced above) may override the wrapper preset; the wrapper default
   # is the fallback (code: open egress, pentest: allowlist).
   local SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
   local MODE_TAG=""
   [[ "$SBX_OPEN_NETWORK" == "1" ]] && MODE_TAG=", open network"
+
   # ----------------------------------------------- model config (injection)
   # The sandbox reuses the host's Claude Code model setup (SBX_CLAUDE_CONFIG,
   # default ~/claude.sh) — same model, effort, context window and key — with
   # one rewrite: a loopback ANTHROPIC_BASE_URL is pointed at the host through
-  # the bridge gateway (172.28.0.1) instead of localhost. Only `export ...`
+  # host.containers.internal (pasta host address) instead of localhost. The
+  # host address is a *trusted* proxy upstream (SBX_PROXY_TRUSTED below) —
+  # it is a runtime exception, never a user allowlist entry. Only `export ...`
   # lines are evaluated, so the file's comments and trailing `claude ...`
   # invocation are ignored. The result is injected as env vars, standalone;
   # no file is mounted into the container.
@@ -99,8 +168,8 @@ sbx_main() {
       env -i sh -c '
         eval "$1"
         case "${ANTHROPIC_BASE_URL:-}" in
-          http://localhost:*)   ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL/localhost/172.28.0.1} ;;
-          http://127.0.0.1:*)   ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL/127.0.0.1/172.28.0.1} ;;
+          http://localhost:*)   ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL/localhost/host.containers.internal} ;;
+          http://127.0.0.1:*)   ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL/127.0.0.1/host.containers.internal} ;;
         esac
         export ANTHROPIC_BASE_URL
         env' sh "$cfg_exports"
@@ -113,51 +182,91 @@ sbx_main() {
     cfg_rest="${cfg_rest%/}"
     cfg_port="${cfg_rest##*:}"
     if [[ "$cfg_rest" == *:* && "$cfg_port" =~ ^[0-9]+$ ]]; then
-      SBX_HOST_PORTS="${SBX_HOST_PORTS:-$cfg_port}"
-      CFG_GATEWAY_ENTRY="172.28.0.1:$cfg_port"
+      PROXY_TRUSTED="host.containers.internal:$cfg_port"
     fi
     echo ">> model config: $SBX_CLAUDE_CONFIG (base_url=${cfg_url:-n/a})"
   else
     echo "warn: no model config at $SBX_CLAUDE_CONFIG; falling back to ANTHROPIC_API_KEY in .env." >&2
     CONFIG_ENV=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY in .env, or provide a model config via SBX_CLAUDE_CONFIG}")
   fi
-  # Comma-separated tcp ports on the host gateway (172.28.0.1) the sandbox may
-  # reach. Defaults to the port parsed from the model config's base URL above.
-  SBX_HOST_PORTS="${SBX_HOST_PORTS:-}"
 
-  # ------------------------------------------------------------- docker
-  local DOCKER=docker
-  if ! $DOCKER info >/dev/null 2>&1; then
-    if sudo -n docker info >/dev/null 2>&1; then
-      DOCKER="sudo docker"
-    else
-      echo "error: docker daemon unreachable (or permission denied)." >&2
-      echo "  start it with:  sudo systemctl enable --now docker" >&2
-      exit 1
-    fi
+  # ---------------------------------------------------- host ports (explicit)
+  # -H <port>: host ports the sandbox may reach (test instances on the host,
+  # e.g. 8080). Each port becomes a trusted proxy upstream for
+  # host.containers.internal — an explicit, per-port runtime exception.
+  # The host address is link-local, so the proxy's always-deny and
+  # DNS-rebind guards refuse it no matter what the user allowlist (or open
+  # network) says: the host is only ever reachable here.
+  local p
+  if (( ${#HOST_PORTS[@]} )); then
+    for p in "${HOST_PORTS[@]}"; do
+      p="${p//[[:space:]]/}"
+      if [[ ! "$p" =~ ^[0-9]+$ ]] || ! (( p >= 1 && p <= 65535 )); then
+        echo "error: -H: bad port '$p' (need 1-65535)" >&2
+        sbx_usage 1
+      fi
+      case " $PROXY_TRUSTED " in
+        *" host.containers.internal:$p "*) ;;
+        *) PROXY_TRUSTED="${PROXY_TRUSTED:+$PROXY_TRUSTED,}host.containers.internal:$p" ;;
+      esac
+    done
+    echo ">> host ports: ${HOST_PORTS[*]} (via host.containers.internal)"
   fi
+
+  # ----------------------------------------------------------- podman check
+  # PODMAN is global: the EXIT trap (sbx_cleanup) runs after this function
+  # has returned, and still needs the runtime name.
+  PODMAN="${PODMAN:-podman}"
+  if ! command -v "$PODMAN" >/dev/null 2>&1; then
+    echo "error: podman not found in PATH." >&2
+    exit 1
+  fi
+  if ! $PODMAN info >/dev/null 2>&1; then
+    echo "error: rootless podman unreachable (podman info failed)." >&2
+    exit 1
+  fi
+  if [[ "$EUID" -eq 0 ]]; then
+    echo "error: refusing to run rootful. Run as the sandbox user (no sudo)." >&2
+    exit 1
+  fi
+
+  # ------------------------------------------------------------- session id
+  # $S is namespaced per usecase+second+PID; concurrent sessions can't
+  # collide, and sbx_reap_orphans only ever touches what it created.
+  S="${SBX_USECASE}-$(date +%s)-$$"
+  NET_NAME="sbx-$S-int"
+  PROXY_NAME="sbx-$S-proxy"
+  SBX_NAME="sbx-$S"
+  trap sbx_cleanup EXIT
+
+  sbx_reap_orphans
 
   # ------------------------------------------------------------ build
-  if [[ "$REBUILD" -eq 1 ]] || ! image_exists "$SBX_IMAGE"; then
-    echo ">> building $SBX_IMAGE"
-    $DOCKER build -t "$SBX_IMAGE" "$SCRIPT_DIR/$SBX_CONTEXT"
+  build_image() {
+    local img="$1" ctx="$2"
+    if [[ "$REBUILD" -eq 1 ]] || ! image_exists "$img"; then
+      echo ">> building $img"
+      $PODMAN build -t "$img" "$SCRIPT_DIR/$ctx"
+    fi
+  }
+  # pentest is built FROM harrbjorn/code, so code must exist first.
+  if [[ "$SBX_CONTEXT" == "pentest" ]]; then
+    build_image harrbjorn/code:latest code
   fi
-  if [[ "$REBUILD" -eq 1 ]] || ! image_exists "harrbjorn/sbx-proxy:latest"; then
-    echo ">> building harrbjorn/sbx-proxy:latest"
-    $DOCKER build -t harrbjorn/sbx-proxy:latest "$SCRIPT_DIR/proxy"
-  fi
+  build_image "$SBX_IMAGE" "$SBX_CONTEXT"
+  build_image harrbjorn/sbx-proxy:latest proxy
 
-  # ----------------------------------------------------------- networks
-  $DOCKER network create --driver bridge --internal --subnet 172.28.0.0/24 sbx-internal \
-    || true
-  $DOCKER network create --driver bridge --subnet 172.29.0.0/24 sbx-egress \
-    || true
+  # ----------------------------------------------------------- network
+  $PODMAN network create --internal "$NET_NAME" >/dev/null
 
   # --------------------------------------------------------- allowlist
   mkdir -p "$STATE_DIR"
   [[ -f "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" ]] \
     || { echo "error: allowlist default '$SBX_ALLOWLIST_DEFAULT' not found" >&2; exit 1; }
-  MERGED="$STATE_DIR/allowlist.txt"
+  # Per-session merged allowlist: concurrent sessions (code + pentest) must
+  # not share one file — each proxy loads whatever the other session wrote
+  # last, and -a targets would be lost.
+  MERGED="$STATE_DIR/allowlist-$S.txt"
   {
     echo "# merged at $(date -u +%Y-%m-%dT%H:%M:%SZ) by harrbjorn $SBX_USECASE"
     grep -vE '^\s*(#|$)' "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" || true
@@ -165,101 +274,68 @@ sbx_main() {
     if [[ -n "$EXTRA_ALLOWLIST" ]]; then
       grep -vE '^\s*(#|$)' "$EXTRA_ALLOWLIST" || true
     fi
-    # Host model server, derived from the model config's base URL.
-    if [[ -n "$CFG_GATEWAY_ENTRY" ]]; then echo "$CFG_GATEWAY_ENTRY"; fi
   } | sort -u > "$MERGED"
-  # Hash only the content lines — the header comment carries a run timestamp.
-  # The open-network mode joins the hash so a mode switch restarts the proxy
-  # even when the merged allowlist is unchanged.
-  HASH="$( { grep -vE '^\s*#' "$MERGED"; printf 'SBX_OPEN_NETWORK=%s\n' "$SBX_OPEN_NETWORK"; } \
-    | sha256sum | awk '{print $1}')"
 
-  # ------------------------------------------------------- proxy (re)start
-  # A rebuilt proxy image (new code) must replace the running container,
-  # not just an allowlist change.
-  if proxy_running && [[ "$(proxy_hash)" == "$HASH" ]] \
-    && [[ "$(proxy_image_id)" == "$(image_id harrbjorn/sbx-proxy:latest)" ]]; then
-    echo ">> proxy sbx-proxy: reusing (allowlist unchanged${MODE_TAG})"
-  else
-    $DOCKER rm -f sbx-proxy >/dev/null 2>&1 || true
-    echo ">> proxy sbx-proxy: starting (allowlist hash ${HASH:0:12}${MODE_TAG})"
-    $DOCKER run -d --name sbx-proxy \
-      --label sbx.allowlist.hash="$HASH" \
-      --label sbx.image.id="$(image_id harrbjorn/sbx-proxy:latest)" \
-      -e SBX_PROXY_OPEN="$SBX_OPEN_NETWORK" \
-      --network sbx-internal --network sbx-egress \
-      --read-only --tmpfs /tmp:size=32m \
-      --cap-drop ALL --security-opt no-new-privileges \
-      --user 65534:65534 \
-      --memory 256m --pids-limit 128 --ulimit nofile=65536:65536 \
-      -v "$MERGED:/allowlist/allowlist.txt:ro,z" \
-      harrbjorn/sbx-proxy:latest >/dev/null
-    # Wait until the proxy accepts connections on the internal net.
-    local i
-    for i in $(seq 1 20); do
-      if $DOCKER exec sbx-proxy python3 -c \
-        "import socket; socket.create_connection(('127.0.0.1', 3128), 0.5).close()" \
-        >/dev/null 2>&1; then break; fi
-      sleep 0.5
-    done
-    if $DOCKER exec sbx-proxy python3 -c \
-      "import socket; socket.create_connection(('127.0.0.1', 3128), 0.5).close()" \
-      >/dev/null 2>&1; then
-      echo ">> proxy is up"
-    else
-      echo "error: proxy failed to start; check: docker logs sbx-proxy" >&2
-      exit 1
-    fi
+  # ------------------------------------------------------------- proxy
+  # Per-session proxy: one hop on pasta's default network (real egress +
+  # host.containers.internal), one hop on the session's internal network
+  # (reaches the sandbox).
+  #
+  # resolv.conf is bind-mounted, not left to the networks: a multi-homed
+  # container's resolv.conf comes from the internal net, whose nameserver
+  # (aardvark) answers NXDOMAIN for every external name — and glibc treats
+  # the *first* nameserver's answer as final, no fallback. The host's real
+  # upstream servers are the proxy's only nameservers. (No search domains:
+  # the proxy only looks up fully qualified names; host.containers.internal
+  # comes from /etc/hosts, not DNS.)
+  local DNS
+  DNS="$(sbx_uplink_dns)" || true
+  if [[ -z "$DNS" ]]; then
+    echo "error: could not determine the host's upstream DNS; the proxy would be blind to external names." >&2
+    exit 1
   fi
-
-  # ------------------------------------------------- host isolation (sudo)
-  if [[ "$HOST_ISOLATION" == "1" ]]; then
-    BRIDGE=""
-    NET_ID="$($DOCKER network inspect -f '{{.Id}}' sbx-internal 2>/dev/null || true)"
-    if [[ -n "$NET_ID" ]]; then
-      BRIDGE="br-${NET_ID:0:12}"
-    fi
-    if [[ -z "$BRIDGE" || ! -e "/sys/class/net/$BRIDGE" ]]; then
-      echo "warn: could not find bridge for sbx-internal; skipping host-isolation iptables." >&2
-    elif ! sudo -n iptables --version >/dev/null 2>&1; then
-      echo "warn: sudo (passwordless) unavailable; host-isolation iptables NOT installed." >&2
-      echo "      install the sudoers drop-in once (etc/harrbjorn-sbx.sudoers; README 'Host-isolasjon')," >&2
-      echo "      or install manually, ports from SBX_HOST_PORTS:" >&2
-      echo "      sudo iptables -N SBX-ISOLATE 2>/dev/null || true" >&2
-      echo "      sudo iptables -A SBX-ISOLATE -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT" >&2
-      echo "      sudo iptables -A SBX-ISOLATE -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT" >&2
-      echo "      sudo iptables -A SBX-ISOLATE -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT" >&2
-      echo "      # for each port P in $SBX_HOST_PORTS:" >&2
-      echo "      # sudo iptables -A SBX-ISOLATE -p tcp --dport P -m conntrack --ctstate NEW -j ACCEPT" >&2
-      echo "      sudo iptables -A SBX-ISOLATE -j DROP" >&2
-      echo "      sudo iptables -I INPUT 1 -i $BRIDGE -j SBX-ISOLATE" >&2
-    else
-      # Rebuild the chain so the port set always matches SBX_HOST_PORTS.
-      local p
-      sudo -n iptables -D INPUT -i "$BRIDGE" -j SBX-ISOLATE 2>/dev/null || true
-      sudo -n iptables -F SBX-ISOLATE 2>/dev/null || true
-      sudo -n iptables -X SBX-ISOLATE 2>/dev/null || true
-      sudo -n iptables -N SBX-ISOLATE
-      sudo -n iptables -A SBX-ISOLATE -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-      sudo -n iptables -A SBX-ISOLATE -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
-      sudo -n iptables -A SBX-ISOLATE -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
-      for p in $(echo "$SBX_HOST_PORTS" | tr ',' ' '); do
-        [[ "$p" =~ ^[0-9]+$ ]] || { echo "error: SBX_HOST_PORTS contains non-numeric port: $p" >&2; exit 1; }
-        sudo -n iptables -A SBX-ISOLATE -p tcp --dport "$p" -m conntrack --ctstate NEW -j ACCEPT
-      done
-      sudo -n iptables -A SBX-ISOLATE -j DROP
-      sudo -n iptables -I INPUT 1 -i "$BRIDGE" -j SBX-ISOLATE
-      echo ">> host isolation: iptables rules in place on $BRIDGE (host tcp ports: ${SBX_HOST_PORTS:-none})"
-    fi
+  RESOLV_CONF="$STATE_DIR/resolv-$S.conf"
+  {
+    echo "# per-session proxy nameservers (written by harrbjorn $SBX_USECASE)"
+    while IFS= read -r ns; do echo "nameserver $ns"; done <<< "$DNS"
+  } > "$RESOLV_CONF"
+  echo ">> proxy $PROXY_NAME: starting (net $NET_NAME${MODE_TAG}, dns: $(printf '%s' "$DNS" | tr '\n' ' '))"
+  $PODMAN run -d --name "$PROXY_NAME" \
+    --userns=keep-id:uid=1000,gid=1000 \
+    --network podman --network "$NET_NAME" \
+    -v "$RESOLV_CONF:/etc/resolv.conf:ro,z" \
+    -e SBX_PROXY_OPEN="$SBX_OPEN_NETWORK" \
+    ${PROXY_TRUSTED:+-e SBX_PROXY_TRUSTED="$PROXY_TRUSTED"} \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --user 65534:65534 \
+    --memory 256m --pids-limit 128 --ulimit nofile=65536:65536 \
+    -v "$MERGED:/allowlist/allowlist.txt:ro,z" \
+    harrbjorn/sbx-proxy:latest >/dev/null
+  # Wait until the proxy accepts connections (its own loopback).
+  local i
+  for i in $(seq 1 20); do
+    if $PODMAN exec "$PROXY_NAME" python3 -c \
+      "import socket; socket.create_connection(('127.0.0.1', 3128), 0.5).close()" \
+      >/dev/null 2>&1; then break; fi
+    sleep 0.5
+  done
+  if $PODMAN exec "$PROXY_NAME" python3 -c \
+    "import socket; socket.create_connection(('127.0.0.1', 3128), 0.5).close()" \
+    >/dev/null 2>&1; then
+    echo ">> proxy is up"
+  else
+    echo "error: proxy failed to start; check: podman logs $PROXY_NAME" >&2
+    exit 1
   fi
 
   # --------------------------------------------- persistent agent HOME
-  # Claude Code keeps its onboarding/settings state in HOME (~/.claude.json and
-  # ~/.claude/). Persist it on the host so state survives between runs; the
-  # rest of the container filesystem stays read-only.
-  AGENT_HOME="$STATE_DIR/agent-home"
+  # Claude Code keeps its onboarding/settings state in HOME (~/.claude.json
+  # and ~/.claude/). Persist it on the host so state survives between runs;
+  # the rest of the container filesystem stays read-only. keep-id maps
+  # container uid 1000 to this user's host uid, so no chown is needed.
+  local AGENT_HOME="$STATE_DIR/agent-home"
   mkdir -p "$AGENT_HOME"
-  chown 1000:1000 "$AGENT_HOME"
   chmod 0700 "$AGENT_HOME"
 
   # Pre-seed Claude Code's interactive state so the first-run wizard (theme ->
@@ -312,23 +388,27 @@ PYEOF
 
   # ------------------------------------------------------------- sandbox
   # -i is always required so stdin reaches the container; -t only with a TTY.
+  # tmpfs mounts need no uid=/gid=: keep-id makes container 1000 == host
+  # 1000, and rootless podman rejects uid=/gid= options anyway.
   T="-i"
   [[ -t 0 && -t 1 ]] && T="-it"
 
   echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS cmd=${CMD[*]}${MODE_TAG}"
-  $DOCKER run --rm $T --name "sbx-$SBX_USECASE-$(date +%s)" \
-    --network sbx-internal \
+  $PODMAN run --rm $T --name "$SBX_NAME" \
+    --userns=keep-id:uid=1000,gid=1000 \
+    --network "$NET_NAME" \
     --user 1000:1000 \
     -v "$WORKDIR_ABS:/work:z" -v "$AGENT_HOME:/home/agent:z" -w /work \
     "${CONFIG_ENV[@]}" \
     -e HOME=/home/agent \
-    -e HTTP_PROXY=http://sbx-proxy:3128 -e http_proxy=http://sbx-proxy:3128 \
-    -e HTTPS_PROXY=http://sbx-proxy:3128 -e https_proxy=http://sbx-proxy:3128 \
+    -e LANG="$SBX_LOCALE" \
+    -e HTTP_PROXY="http://$PROXY_NAME:3128" -e http_proxy="http://$PROXY_NAME:3128" \
+    -e HTTPS_PROXY="http://$PROXY_NAME:3128" -e https_proxy="http://$PROXY_NAME:3128" \
     -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1' \
     -e DISABLE_TELEMETRY=1 -e DO_NOT_TRACK=1 -e DISABLE_AUTOUPDATER=1 \
     --read-only \
-    --tmpfs /tmp:uid=1000,gid=1000,size=1g,mode=1777 \
-    --tmpfs /var/tmp:uid=1000,gid=1000,size=256m,mode=1777 \
+    --tmpfs /tmp:size=1g,mode=1777 \
+    --tmpfs /var/tmp:size=256m,mode=1777 \
     --cap-drop ALL --security-opt no-new-privileges:true \
     --pids-limit "$SBX_PIDS" --memory "$SBX_MEMORY" --cpus "$SBX_CPUS" \
     --ulimit nofile=65536:65536 \
