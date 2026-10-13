@@ -24,7 +24,10 @@ setter bare `SBX_USECASE`/`SBX_IMAGE`/`SBX_CONTEXT`/`SBX_ALLOWLIST_DEFAULT`.
 Den innsperrede agenten skal:
 
 - **kun** skrive i den spesifiserte workspace-direktivet (rw-bindmount til `/work`)
-  og sin egen agent-HOME (persistert under `.sandbox/agent-home`)
+  og sin egen agent-HOME (persistert under `.sandbox/agent-home/<usecase>/<workdir>`)
+- **ikke** dele filsystem-state med andre instanser: agent-HOME-nøkkelen er
+  usecase + workdir, så ulik workdir — eller ulik usecase i samme workdir —
+  gir helt separate HOME-er (maven cache, agent-logger, o.l. deles aldri)
 - **kun** ha nettverksutgang via forward-proxyen over http(s):
   - **kodeagent**: åpen utgang som standard (`SBX_OPEN_NETWORK=1`);
     `SBX_OPEN_NETWORK=0` gir klassisk host(:port)-whitelist
@@ -102,7 +105,9 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
 4. **Container-hardening** — `--read-only`, `--cap-drop ALL`,
    `--security-opt no-new-privileges`, keep-id user-namespace (containerens
    uid 1000 = hostens uid 1000, så bindmounter eies av hostbrukeren utenfor),
-   tmpfs over /tmp og /var/tmp, persistent agent-HOME (`.sandbox/agent-home` —
+   tmpfs over /tmp og /var/tmp, persistent agent-HOME
+   (`.sandbox/agent-home/<usecase>/<workdir>` — nøkkelset på usecase + workdir,
+   kun instanser i samme workdir OG usecase deler state;
    Claude Code sitt onboarding/settings-state, pre-seedet ved hver kjør:
    onboarding fullført, `/work`-trust-dialog acceptert, modelconfigens
    API-key approvet, permission-mode satt til `bypassPermissions`
@@ -304,6 +309,20 @@ Pentest-variant (mål i allowlisten via `-a`, dev-hosts skal være borte):
 podman logs "$(podman ps --filter name=sbx- --format '{{.Names}}' | grep -m1 proxy)" | tail
 ```
 
+Agent-HOME-isolasjon (nøkkel = usecase + workdir; ulik nøkkel deler ingen
+filsystem-state):
+
+```bash
+mkdir -p /tmp/sbx-a /tmp/sbx-b
+./run-code.sh -w /tmp/sbx-a -- sh -c 'echo marker > ~/.cross; mkdir -p ~/.m2; echo x > ~/.m2/marker'
+./run-code.sh -w /tmp/sbx-b -- sh -c 'test ! -e ~/.cross && test ! -e ~/.m2/marker && echo ISOLATED'
+# → ISOLATED (annen workdir, samme usecase: egen agent-HOME)
+./run-pentest.sh -w /tmp/sbx-a -- sh -c 'test ! -e ~/.cross && echo ISOLATED-USECASE'
+# → ISOLATED-USECASE (samme workdir, annen usecase: egen agent-HOME)
+./run-code.sh -w /tmp/sbx-a -- sh -c 'test -e ~/.cross && test -e ~/.m2/marker && echo SHARED'
+# → SHARED (samme workdir+usecase: state overlever mellom kjør)
+```
+
 ## Begrensninger
 
 - Allowlist-håndhevingen ligger i proxy-prosessen. Mitigering: ~450 linjer
@@ -334,7 +353,9 @@ podman logs "$(podman ps --filter name=sbx- --format '{{.Names}}' | grep -m1 pro
   (tmpfs-monter slipper `uid=`/`gid=`-oppsjørs — rootless
   podman avviser dem i det hele tatt.)
 - Per-sesjonstate under `.sandbox/`: sammensmeltet allowlisten, per-sesjons
-  proxy `resolv.conf`, agent-HOME. `.env` (nøkler) er git-ignoreret.
+  proxy `resolv.conf`, agent-HOME per workdir+usecase (akkumuleres —
+  ryddes manuelt per key, `rm -rf .sandbox` fjerner alt). `.env` (nøkler)
+  er git-ignoreret.
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter.
 

@@ -334,7 +334,14 @@ sbx_main() {
   # and ~/.claude/). Persist it on the host so state survives between runs;
   # the rest of the container filesystem stays read-only. keep-id maps
   # container uid 1000 to this user's host uid, so no chown is needed.
-  local AGENT_HOME="$STATE_DIR/agent-home"
+  #
+  # Keyed by usecase + absolute workdir: instances in different workdirs —
+  # or in different usecases with the same workdir — share no filesystem
+  # state (a pentest agent must not read/write a code agent's maven cache,
+  # agent logs, ...). Same usecase + workdir share the HOME, so caches and
+  # agent state survive between runs. The path mirrors the workdir under
+  # .sandbox/agent-home/<usecase>/ so each key is visible and deletable.
+  local AGENT_HOME="$STATE_DIR/agent-home/$SBX_USECASE${WORKDIR_ABS}"
   mkdir -p "$AGENT_HOME"
   chmod 0700 "$AGENT_HOME"
 
@@ -393,7 +400,7 @@ PYEOF
   T="-i"
   [[ -t 0 && -t 1 ]] && T="-it"
 
-  echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS cmd=${CMD[*]}${MODE_TAG}"
+  echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS agent_home=$AGENT_HOME cmd=${CMD[*]}${MODE_TAG}"
   $PODMAN run --rm $T --name "$SBX_NAME" \
     --userns=keep-id:uid=1000,gid=1000 \
     --network "$NET_NAME" \
