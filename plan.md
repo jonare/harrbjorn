@@ -17,9 +17,38 @@ fra analysen. Kun lokal kjøring på Linux-laptop (Fedora).
 Løst: symlink-angrepet mot host-seedingen av agent-HOME — seeding flyttet
 fra hosten til init-steg i containeren (`code/sbx-init.sh`). Se «Relatert».
 
+## Status (per 2026-10-14)
+
+| Punkt | Status |
+|---|---|
+| 1. Rootless Podman | ✅ Løst (`e35f8af` + fiks `80b2605`, `9501dd8`, `e5b3352`) |
+| 2. krun/gVisor-runtime | ✅ Løst (`eb59ba7`) — `SBX_RUNTIME` (`krun` default, `runsc`/`crun` eksplisitt), hard fail hvis valgt runtime (eller `/dev/kvm`) mangler |
+| 3. Smokescreen | ❌ Ikke løst — `proxy/proxy.py` i bruk enda (`harrbjorn/sbx-proxy` er python-bilde) |
+| 4. Nettverk per sesjon | ✅ Løst sammen med 1 — per-sesjon `--internal`-nett + proxy, per-sesjon `resolv.conf`/allowlist, orphan-reaping, `-H`, ingen iptables/sudo |
+| 5. copy-in/patch-ut | ❌ Ikke løst — fortsatt rw-bindmount til `/work`; ingen `--mount-workspace`, ingen `-w`-sperre |
+
+Relatert: agent-HOME-seeding inne i containeren ✅ (`3422ab5`,
+`code/sbx-init.sh`); agent-HOME per usecase+workdir ✅ (`9fb7277`);
+hemmeligheter via `--env-file`/`podman secret` ❌ (fortsatt `-e` på
+kommandolinjen, inkl. modelconfigens env-vars).
+
+Siden planen er skrevet (utenfor 1-5): `harrbjorn`-CLI-dispatcher med bash
+autocompletion (`894b240`), interaktiv bash som default uten kommando
+(`432e5d0`), norsk lokal `nb_NO.UTF-8` (`22891b0`). Åpne poster i
+`issues.md`: pi agent-harness (installere + sette opp likt som claude i
+begge sandboxene) og exit fra container henger; i `todo.md`: statusline i
+container som native.
+
 ---
 
-## 1. Rootless Podman i stedet for rootful Docker
+## 1. Rootless Podman i stedet for rootful Docker — ✅ LØST
+
+Implementert i `e35f8af` (fiks i `80b2605`, `9501dd8`, `e5b3352`): podman
+rootless uten sudo, `--userns=keep-id:uid=1000,gid=1000` + `--user 1000:1000`,
+chown/tmpfs-`uid=`-hardkoding fjernet, hardening beholdt, base-images pinnet
+på digest (`node:22-bookworm-slim@sha256:...`, `python:3.13-slim@sha256:...`)
+og Claude Code låst til versjon (`@anthropic-ai/claude-code@2.1.296`),
+`pentest/Dockerfile` bygger `FROM harrbjorn/code`.
 
 **Endringer**
 - Erstatt `$DOCKER`-logikken (inkl. `sudo docker`-fallback) med `podman`.
@@ -42,7 +71,17 @@ fra hosten til init-steg i containeren (`code/sbx-init.sh`). Se «Relatert».
   og pasta som rootless-nettverk.
 - Fil skrevet i `/work` eies av hostbrukeren (`stat`).
 
-## 2. Sterkere runtime: libkrun (primær), gVisor (fallback)
+## 2. Sterkere runtime: libkrun (primær), gVisor (fallback) — ✅ LØST
+
+Implementert i `eb59ba7`: `SBX_RUNTIME` (`krun` | `runsc` | `crun`),
+default `krun`, gjelder begge sesjonscontainerne (sandbox og proxy).
+`sbx_check_runtime` feiler hardt før noen sesjonsressurs skapes hvis
+valgt runtime mangler — og for krun kreves tilleggsvis `/dev/kvm`.
+Ingen stille fallback til `crun`, som kun velges eksplisitt. To
+krun-spesifikke tilpasninger funnet ved verifisering: readiness-proben
+leser proxyens log-linje (krun implementerer ikke `podman exec`), og
+cleanup bruker `stop -t 1` (krun rapporterer ikke SIGTERM-stopp innen
+standard tidsgrense).
 
 **Valg**
 - Primær: `crun-krun` (`podman run --runtime krun` eller
@@ -75,7 +114,10 @@ fra hosten til init-steg i containeren (`code/sbx-init.sh`). Se «Relatert».
 - `uname -r` i containeren er en annen kjerne enn hosten (krun).
 - Self-testen fra punkt 4 består med valgt runtime.
 
-## 3. Smokescreen i stedet for `proxy/proxy.py`
+## 3. Smokescreen i stedet for `proxy/proxy.py` — ❌ IKKE LØST
+
+`proxy/proxy.py` er i bruk enda; `harrbjorn/sbx-proxy` er et python-bilde
+(`python:3.13-slim` + `proxy.py`), ikke Smokescreen.
 
 **Endringer**
 - Nytt bilde `harrbjorn/sbx-proxy` bygget fra pinnet Smokescreen-release
@@ -110,7 +152,14 @@ fra hosten til init-steg i containeren (`code/sbx-init.sh`). Se «Relatert».
   `http://169.254.169.254/` → alle avvist.
 - Allowlist-modus: ikke-listet domene → avvist; listet domene → OK.
 
-## 4. Nettverk: rootless netns, proxy per sesjon, ingen iptables
+## 4. Nettverk: rootless netns, proxy per sesjon, ingen iptables — ✅ LØST
+
+Implementert i `e35f8af` (sammen med punkt 1): per-sesjon `sbx-$S-int`
+(`--internal`) + per-sesjon proxy med bindet per-sesjons `resolv.conf`
+(hostens oppstrøms-DNS, glibc-first-NS-funnet håndtert), `EXIT`-trap +
+orphan-reaping, modellport auto-trusted fra modelconfigen, `-H` for
+eksplisitte host-porter (`9501dd8`, fiks i `e5b3352`). SBX-ISOLATE-kjeden,
+sudoers, bridge- og `--no-host-isolation`-logikken er fjernet.
 
 **Merk:** containere i samme Podman-pod deler nettverksnavnerom, så
 «sandbox og proxy i én pod» gir sandboxen samme utgang som proxyen. Det
@@ -179,7 +228,10 @@ fungerer ikke; bruk separate nettverk som under.
 - To samtidige sesjoner (code open + pentest allowlist): pentest-sesjonen
   får fortsatt avslag på ikke-listede domener.
 
-## 5. Workspace: copy-in / patch-ut
+## 5. Workspace: copy-in / patch-ut — ❌ IKKE LØST
+
+Workspace er fortsatt rw-bindmount til `/work` (`-v "$WORKDIR_ABS:/work:z"`);
+ingen copy-in, patch-ut, `--mount-workspace` eller `-w`-sperre.
 
 **Design**
 - Default: workspace mountes **ikke**. I stedet:
@@ -223,26 +275,34 @@ fungerer ikke; bruk separate nettverk som under.
   `mkdir -p`/`chmod` av selve AGENT_HOME-veien under `.sandbox/` (aldri
   montert i containeren, så ingen agent-kjører kan plante lenker der) —
   ingen host-skriver faller lenger i agentkontrollert katalog.
-- Agent-HOME per workspace i stedet for felles for alle sesjoner og begge
-  usecases.
+- **Løst (`9fb7277`):** Agent-HOME per workspace i stedet for felles for
+  alle sesjoner og begge usecases — nøkkelt på usecase + absolutt workdir
+  (`.sandbox/agent-home/<usecase>/<workdir>`).
 - Hemmeligheter via `--env-file` (0600) eller `podman secret`, ikke `-e` på
-  kommandolinjen.
+  kommandolinjen. **Ikke løst:** modelconfigens env-vars (inkl.
+  `ANTHROPIC_API_KEY`) injiseres fortsatt med `-e` i `lib/sandbox.sh`.
 
 ## Rekkefølge
 
 1. Spike: krun + rootless netns + pasta-hostmapping (avklaringer i 2 og 4).
    Avgjør runtime og hvordan modellserveren nås før resten bygges.
+   ✅ Gjennomført 2026-10-09 (se «Avklart» i 2 og 4).
 2. Punkt 1 og 4 sammen (Podman + nettverk per sesjon), med dagens
-   `proxy.py` midlertidig.
-3. Punkt 3 (Smokescreen), slett `proxy.py`.
-4. Punkt 2 (runtime på som default).
-5. Punkt 5 (copy-in/patch-ut).
+   `proxy.py` midlertidig. ✅ `e35f8af` (+ fiks `80b2605`, `9501dd8`,
+   `e5b3352`); `proxy.py` er fremdeles midlertidig.
+3. Punkt 3 (Smokescreen), slett `proxy.py`. ⏳ Ikke påbegynt.
+4. Punkt 2 (runtime på som default). ✅ `eb59ba7`.
+5. Punkt 5 (copy-in/patch-ut). ⏳ Ikke påbegynt.
 6. Skriv om README (trusselmodell, arkitektur, self-test) og slett
-   iptables/sudoers-seksjonene.
+   iptables/sudoers-seksjonene. ✅ `9501dd8` — README skrevet om for
+   rootless podman; iptables/sudoers-seksjonene erstattet av
+   «Host-isolasjon»-avsnittet (ingen iptables).
 
 ## Hva som slettes
 
-- `etc/harrbjorn-sbx.sudoers`
-- `proxy/proxy.py`
+- `etc/harrbjorn-sbx.sudoers` ✅ Slettet.
+- `proxy/proxy.py` ❌ Eksisterer fremdeles (avventer punkt 3).
 - iptables-, bridge-, sudo-docker- og label-hash-logikken i `lib/sandbox.sh`
-- `HOST_ISOLATION`, `SBX_HOST_PORTS`, `--no-host-isolation`
+  ✅ Fjernet.
+- `HOST_ISOLATION`, `SBX_HOST_PORTS`, `--no-host-isolation` ✅ Fjernet
+  (erstattet av eksplisitt `-H <port>`).

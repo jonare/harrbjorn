@@ -15,6 +15,10 @@
 # Runtime: rootless Podman, --userns=keep-id, per-sesjon nett (podman network
 # --internal) med per-sesjon proxy som eneste utgang. Ingen sudo: hosten
 # berøres aldri (nattverks-isolasjon kjører i nettverket, ikke i iptables).
+#
+# OCI-runtime (SBX_RUNTIME): krun (microVM via KVM, default), runsc (gVisor)
+# eller crun (eksplisitt valgt — aldri stille fallback). Wrapperen feiler
+# hvis valgt runtime (eller /dev/kvm for krun) mangler.
 
 set -euo pipefail
 
@@ -35,7 +39,13 @@ NET_NAME=""
 RESOLV_CONF=""
 
 sbx_cleanup() {
-  $PODMAN rm -f "$PROXY_NAME" >/dev/null 2>&1 || true
+  # stop -t 1 instead of rm -f: krun does not report a SIGTERM stop within
+  # the default 10s stop timeout, so rm -f would make every session teardown
+  # pay ~10s before its own SIGKILL fallback. With -t 1 the SIGKILL fallback
+  # is reached in ~1s — and the session is being torn down either way.
+  # (For crun the SIGTERM stops the proxy promptly; same fast path.)
+  $PODMAN stop -t 1 "$PROXY_NAME" >/dev/null 2>&1 || true
+  $PODMAN rm "$PROXY_NAME" >/dev/null 2>&1 || true
   $PODMAN network rm "$NET_NAME" >/dev/null 2>&1 || true
   rm -f "$RESOLV_CONF"
 }
@@ -105,11 +115,57 @@ for link in data:
   return 1
 }
 
+# ----------------------------------------------------------------- runtime
+# SBX_RUNTIME (env/.env) selects the OCI runtime for BOTH session containers
+# (sandbox and proxy): krun (default — microVM via KVM, own kernel), runsc
+# (gVisor) or crun (plain container, explicit opt-in only). The wrapper fails
+# hard if the chosen runtime is unavailable — never a silent downgrade to
+# crun: with krun a container escape lands in the VM's user namespace, not
+# on the host kernel, and a quiet fallback would drop that boundary without
+# saying so. Fills RUNTIME_ARGS (caller's local) for the `podman run` lines.
+sbx_check_runtime() {
+  local bin
+  case "$SBX_RUNTIME" in
+    krun)
+      bin="$(command -v krun || true)"
+      if [[ -z "$bin" ]]; then
+        echo "error: SBX_RUNTIME=krun but the krun OCI runtime is not installed (Fedora: dnf install crun-krun)." >&2
+        exit 1
+      fi
+      if [[ ! -c /dev/kvm || ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+        echo "error: SBX_RUNTIME=krun but /dev/kvm is not accessible (KVM required — check virtualization support, or set SBX_RUNTIME=crun)." >&2
+        exit 1
+      fi
+      RUNTIME_ARGS=(--runtime krun)
+      ;;
+    runsc)
+      bin="$(command -v runsc || true)"
+      if [[ -z "$bin" ]]; then
+        echo "error: SBX_RUNTIME=runsc but the runsc (gVisor) runtime is not installed." >&2
+        exit 1
+      fi
+      RUNTIME_ARGS=(--runtime runsc)
+      ;;
+    crun)
+      bin="$(command -v crun || true)"
+      if [[ -z "$bin" ]]; then
+        echo "error: SBX_RUNTIME=crun but crun is not installed." >&2
+        exit 1
+      fi
+      RUNTIME_ARGS=(--runtime crun)
+      ;;
+    *)
+      echo "error: invalid SBX_RUNTIME '$SBX_RUNTIME' (must be krun, runsc or crun)." >&2
+      exit 1
+      ;;
+  esac
+}
+
 sbx_main() {
   local WORKDIR="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
   local HOST_PORTS=()
   local REBUILD=0 T CONFIG_ENV=() MERGED
-  local S SBX_NAME PROXY_TRUSTED=""
+  local S SBX_NAME PROXY_TRUSTED="" RUNTIME_ARGS=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -160,6 +216,9 @@ sbx_main() {
   # .env (sourced above) may override the wrapper preset; the wrapper default
   # is the fallback (code: open egress, pentest: allowlist).
   local SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
+  # OCI runtime: krun (microVM, default) / runsc / crun. Checked hard in
+  # sbx_check_runtime (below, after the podman checks) — no silent fallback.
+  local SBX_RUNTIME="${SBX_RUNTIME:-krun}"
   local MODE_TAG=""
   [[ "$SBX_OPEN_NETWORK" == "1" ]] && MODE_TAG=", open network"
 
@@ -243,6 +302,13 @@ sbx_main() {
     exit 1
   fi
 
+  # ------------------------------------------------------------ runtime check
+  # Fails hard, before any session resource is created, when the chosen
+  # runtime or /dev/kvm is unavailable — a quiet fallback to crun would drop
+  # the VM boundary without saying so.
+  sbx_check_runtime
+  echo ">> runtime: $SBX_RUNTIME"
+
   # ------------------------------------------------------------- session id
   # $S is namespaced per usecase+second+PID; concurrent sessions can't
   # collide, and sbx_reap_orphans only ever touches what it created.
@@ -314,6 +380,7 @@ sbx_main() {
   } > "$RESOLV_CONF"
   echo ">> proxy $PROXY_NAME: starting (net $NET_NAME${MODE_TAG}, dns: $(printf '%s' "$DNS" | tr '\n' ' '))"
   $PODMAN run -d --name "$PROXY_NAME" \
+    "${RUNTIME_ARGS[@]}" \
     --userns=keep-id:uid=1000,gid=1000 \
     --network podman --network "$NET_NAME" \
     -v "$RESOLV_CONF:/etc/resolv.conf:ro,z" \
@@ -325,17 +392,19 @@ sbx_main() {
     --memory 256m --pids-limit 128 --ulimit nofile=65536:65536 \
     -v "$MERGED:/allowlist/allowlist.txt:ro,z" \
     harrbjorn/sbx-proxy:latest >/dev/null
-  # Wait until the proxy accepts connections (its own loopback).
+  # Wait until the proxy accepts connections. Probe the proxy's own startup
+  # log line, not `podman exec`: krun (microVM) does not implement exec, so
+  # an in-container connection test would fail on every krun run even when
+  # the proxy is up. Log polling works on every runtime; the line is only
+  # written after the listening socket is bound.
   local i
   for i in $(seq 1 20); do
-    if $PODMAN exec "$PROXY_NAME" python3 -c \
-      "import socket; socket.create_connection(('127.0.0.1', 3128), 0.5).close()" \
-      >/dev/null 2>&1; then break; fi
+    if $PODMAN logs "$PROXY_NAME" 2>/dev/null \
+      | grep -q 'listening on 0.0.0.0:3128'; then break; fi
     sleep 0.5
   done
-  if $PODMAN exec "$PROXY_NAME" python3 -c \
-    "import socket; socket.create_connection(('127.0.0.1', 3128), 0.5).close()" \
-    >/dev/null 2>&1; then
+  if $PODMAN logs "$PROXY_NAME" 2>/dev/null \
+    | grep -q 'listening on 0.0.0.0:3128'; then
     echo ">> proxy is up"
   else
     echo "error: proxy failed to start; check: podman logs $PROXY_NAME" >&2
@@ -378,6 +447,7 @@ sbx_main() {
 
   echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS agent_home=$AGENT_HOME cmd=${CMD[*]}${MODE_TAG}"
   $PODMAN run --rm $T --name "$SBX_NAME" \
+    "${RUNTIME_ARGS[@]}" \
     --userns=keep-id:uid=1000,gid=1000 \
     --network "$NET_NAME" \
     --user 1000:1000 \

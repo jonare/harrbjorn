@@ -120,6 +120,12 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
    gjelder KUN denne user-level-configen i agent-HOME — hostens `~/.claude`
    røres ikke), slik at first-run-vizarden ikke vises),
    pids/memory/cpu-limit.
+5. **MicroVM via krun** (default-runtime) — sandboxen (og proxyen) kjører
+   som microVM-er på KVM: eget kernel, egne prosesser, eget /tmp. En
+   container-escape lander da i VMens user-namespace, ikke på
+   host-kernelen. `SBX_RUNTIME` velger runtime (`krun` default / `runsc` /
+   eksplisitt `crun`) — wrapperen feiler ved oppstart hvis valgt runtime
+   (resp. `/dev/kvm` for krun) mangler; aldri stille fallback til `crun`.
 
 ## Setup
 
@@ -127,9 +133,12 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
 cp .env.example .env                        # valgfrie limit/overrides
 ```
 
-Krever bare Podman (rootless) + crun — standard på Fedora; ingen sudo, ingen
-daemon. Alt annet (bilder bygges ved behov, per-sesjon nettverk, proxy)
-settes opp automatisk av `harrbjorn` (resp. wrapperne) — idempotent.
+Krever Podman (rootless) + crun (standard på Fedora), samt KVM + krun
+(`dnf install crun-krun`) — krun-microVM-er er default-runtime; uten KVM
+settes `SBX_RUNTIME=crun` i `.env` (vanlig container, eksplisitt valgt).
+Ingen sudo, ingen daemon. Alt annet (bilder bygges ved behov, per-sesjon
+nettverk, proxy) settes opp automatisk av `harrbjorn` (resp. wrapperne) —
+idempotent.
 
 CLI-en krever ingen installasjon: kjør `./harrbjorn` i repo-rotten, eller
 symlink den inn i en mappe som allerede er i PATH (`~/.local/bin/harrbjorn`),
@@ -175,6 +184,7 @@ Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
 | | `en_US.UTF-8` | Nøytralt UTF-8-alternativ. Må være generert i bildet (se `code/Dockerfile`). |
 | `SBX_MEMORY` / `SBX_CPUS` / `SBX_PIDS` | f.eks. `4g` / `2` / `1024` | Ressursgrenser for sandboxen (wrapper-defaults i `.env.example`). |
 | `SBX_CLAUDE_CONFIG` | sti | Modelconfig (default `~/claude.sh`). |
+| `SBX_RUNTIME` | `krun` | OCI-runtime for sandbox (og proxy): `krun` (microVM via KVM, default) / `runsc` (gVisor) / `crun` (eksplisitt — aldri stille fallback). Wrapperen feiler ved oppstart hvis valgt runtime (resp. `/dev/kvm` for krun) mangler. |
 
 Default: `code=1` (åpen), `pentest=0` (allowlist). Proxyen skrives opp per
 sesjon — wrapperen viser navnet (`sbx-<usecase>-<ts>-<pid>-proxy`) på
@@ -300,6 +310,7 @@ cd -
 mkdir -p /tmp/sbx-test
 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   set -x
+  uname -r                                                   # ≠ host-kernel (microVM; krun)
   curl -sI https://api.anthropic.com | head -1                 # via proxy → OK
   curl -sI https://example.com | head -1                       # → OK (åpen utgang som standard)
   curl -s --max-time 5 http://host.containers.internal/ || true      # host port 80 → 502 (alt-avvis)
@@ -323,6 +334,10 @@ SBX_OPEN_NETWORK=0 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   curl -sI https://api.anthropic.com | head -1   # → OK (i allowlist.code.default)
   curl -sI https://example.com | head -1         # → avvises (ikke i allowlisten)
 '
+
+# Valgt runtime mangler → hard feil, ingen stille fallback til crun
+SBX_RUNTIME=runsc ./run-code.sh -w /tmp/sbx-test -- sh -c 'true' 2>&1 \
+  | grep -F 'error: SBX_RUNTIME=runsc'                         # → match (exit 1)
 
 # Agent kjører via proxy
 ./run-code.sh -w /tmp/sbx-test -- claude -p "Svar bare: OK"
@@ -390,6 +405,10 @@ mkdir -p /tmp/sbx-a /tmp/sbx-b
   er git-ignoreret.
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter.
+- krun-microVM-er (default-runtime): ~90 MB minne per VM (sandbox + proxy)
+  og oppstarts-tak i sekunder; bindmounter går via virtio-fs.
+  `SBX_RUNTIME=crun` (eksplisitt) fjerner VM-laget — en container-escape
+  lander da på host-kernelen.
 
 ## Fjerne (hvis du sletter oppsettet helt)
 

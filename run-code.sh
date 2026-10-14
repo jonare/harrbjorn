@@ -35,10 +35,11 @@
 #   1. sandbox kjører kun på sesjonens internal-nett (ingen direkte utgang)
 #   2. forward-proxy er eneste utgang; åpen som standard, audit-logg alltid
 #   3. container-hardening: read-only, cap-drop ALL, no-new-privileges, limits
-#   4. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
+#   4. microVM via krun (eget kernel — KVM; SBX_RUNTIME)
+#   5. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
 
 set -euo pipefail
-sbx_usage() { sed -n '2,38p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,39p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code
