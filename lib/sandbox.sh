@@ -128,8 +128,15 @@ sbx_main() {
       *) break ;;  # first non-flag argument starts the command; `--` is optional
     esac
   done
-  [[ $# -gt 0 ]] || { echo "error: no command" >&2; sbx_usage 1; }
-  local CMD=("$@")
+  # No command → default to an interactive bash in the workdir: a bare
+  # `harrbjorn code` / `harrbjorn security` drops you into a shell to poke
+  # around (the TTY handling below attaches a terminal — -it — when one is
+  # present, so bash is interactive). Passing a command runs it instead.
+  if [[ $# -gt 0 ]]; then
+    local CMD=("$@")
+  else
+    local CMD=(bash)
+  fi
   # -w is optional: the workspace defaults to the current directory.
   WORKDIR="${WORKDIR:-$PWD}"
   [[ -d "$WORKDIR" ]] || { echo "error: workdir $WORKDIR does not exist" >&2; exit 1; }

@@ -3,10 +3,11 @@
 #
 # Usage:
 #   harrbjorn code [-w <workdir>] [-a host[:port]]... [-H port]...
-#                  [-f extra-allowlist] [--rebuild] [--] <cmd> [args...]
+#                  [-f extra-allowlist] [--rebuild] [--] [<cmd> [args...]]
 #   (equivalent to ./run-code.sh; <workdir> defaults to the current
 #   directory, and `--` is optional — the first non-flag argument
-#   starts the command)
+#   starts the command. With no command, an interactive bash opens in
+#   the workdir)
 #
 #   Model config: hostens Claude-config (SBX_CLAUDE_CONFIG, default
 #   ~/claude.sh) injiseres som env-vars; loopback -> host.containers.internal.
@@ -22,11 +23,12 @@
 #   veien, og ikke en allowlistpost.
 #
 # Eksempler:
-#   harrbjorn code                          # interaktiv claude i cwd
+#   harrbjorn code                          # interaktiv bash i cwd (default)
+#   harrbjorn code bash                     # samme, eksplisitt
+#   harrbjorn code claude                   # interaktiv claude i cwd
 #   harrbjorn code claude -p "Refaktoriser auth-modulen"
 #   (containernens claude kjører med bypassPermissions som default — ingen
 #    --dangerously-skip-permissions-flagg nødvendig)
-#   harrbjorn code bash                     # vanlig dev-bruk
 #   harrbjorn code -w ~/proj claude         # annen workdir enn cwd
 #
 # Isolasjonslag (rootless podman, ingen sudo; hvert holder selv hvis ett feiler):
@@ -36,7 +38,7 @@
 #   4. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
 
 set -euo pipefail
-sbx_usage() { sed -n '2,36p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,38p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code

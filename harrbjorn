@@ -6,7 +6,8 @@
 #   harrbjorn security <args>    sikkerhetstest-sandbox (run-pentest.sh)
 #
 #   <args> går uendret til usecase-wrapperen (se `run-code.sh -h` /
-#   `run-pentest.sh -h`); workdir er cwd med mindre -w gis.
+#   `run-pentest.sh -h`); workdir er cwd med mindre -w gis. Med ingen
+#   kommando åpnes en interaktiv bash i workdir.
 #
 # PATH (ingen installasjon): symlinke denne filen inn i en mappe som
 # allerede ligger i PATH, eller legg repo-rotten i PATH.
@@ -15,13 +16,14 @@
 #   eval "$(harrbjorn completion)"
 #
 # Eksempler:
-#   harrbjorn code claude                          # interaktiv i cwd
+#   harrbjorn code                               # interaktiv bash i cwd (default)
+#   harrbjorn code claude                        # interaktiv claude i cwd
 #   harrbjorn security -a 10.0.0.5:8080 claude -p "Test målet"
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-usage() { sed -n '2,19p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,21p' "$0"; exit "${1:-0}"; }
 
 # Autocomplete (bash): fullfører subkommandoene (code, security) og
 # usecase-flaggene (-w -a -H -f --rebuild). Eval-eres fra ~/.bashrc:

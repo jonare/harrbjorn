@@ -147,18 +147,19 @@ harrbjorn security <args>  # sikkerhetstest-sandbox (run-pentest.sh)
 ```
 
 `<args>` går uendret til usecase-wrapperen; den første non-flag-argen starter
-kommandoen, så `--` er valgfri. Wrapperne kan også kjøres direkte:
+kommandoen, så `--` er valgfri. Med ingen kommando åpnes en interaktiv bash i
+workdir (default). Wrapperne kan også kjøres direkte:
 
 ```bash
-./run-code.sh    [-w <workdir>] [--flagg] [--] <kommando> [args...]
-./run-pentest.sh [-w <workdir>] [--flagg] [--] <kommando> [args...]
+./run-code.sh    [-w <workdir>] [--flagg] [--] [kommando [args...]]
+./run-pentest.sh [-w <workdir>] [--flagg] [--] [kommando [args...]]
 ```
 
 Flagg (identiske i begge):
 
 | Flag | Effekt |
 |---|---|
-| `-w DIR` | Workspace (bindmount til `/work`, rw). Default: gjeldende direktori. |
+| `-w DIR` | Workspace (bindmount til `/work`, rw). Default: gjeldende workdir. |
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). Bare relevant i allowlist-modus. |
 | `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream. Den eneste veien til hosten — se [Host-tjenester](#host-tjenester). |
 | `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). Bare relevant i allowlist-modus. |
@@ -179,23 +180,26 @@ Default: `code=1` (åpen), `pentest=0` (allowlist). Proxyen skrives opp per
 sesjon — wrapperen viser navnet (`sbx-<usecase>-<ts>-<pid>-proxy`) på
 start.
 
-Eksempler — kodeagent (kjører i gjeldende direktori; `-w` for annen workdir):
+Eksempler — kodeagent (kjører i gjeldende workdir; `-w` for annen workdir):
 
 ```bash
+# Interaktiv bash i gjeldende workdir (default — ingen kommando)
+harrbjorn code
+
 # Interaktiv Claude Code-sesjon i et prosjekt
 cd ~/proj && harrbjorn code claude
 
 # Énkjørs-agenter
 harrbjorn code -w ~/proj claude -p "Refaktoriser auth-modulen"
-
-# Vanlig dev-bruk
-harrbjorn code bash
 ```
 
 Eksempler — sikkerhetstesting (målene ligger IKKE i default-allowlisten,
 legges til med `-a` ved kjør):
 
 ```bash
+# Interaktiv bash i gjeldende workdir (default — ingen kommando)
+harrbjorn security
+
 # agent-drevet pentest (i målets workspace)
 harrbjorn security -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
   claude -p "Portscan og test 192.168.50.10"
