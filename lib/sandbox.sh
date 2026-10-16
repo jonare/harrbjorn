@@ -37,6 +37,8 @@ SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
 PROXY_NAME=""
 NET_NAME=""
 RESOLV_CONF=""
+POLICY_DIR=""
+SESSION_LOG=""
 
 sbx_cleanup() {
   # stop -t 1 instead of rm -f: krun does not report a SIGTERM stop within
@@ -45,9 +47,19 @@ sbx_cleanup() {
   # is reached in ~1s — and the session is being torn down either way.
   # (For crun the SIGTERM stops the proxy promptly; same fast path.)
   $PODMAN stop -t 1 "$PROXY_NAME" >/dev/null 2>&1 || true
+
+  # Audit log: the proxy's JSON lines (per-request allow/deny decisions,
+  # with the reason) are kept at .sandbox/logs/<session>.jsonl for later
+  # debugging — captured while the proxy container still exists.
+  if [[ -n "$PROXY_NAME" && -n "$SESSION_LOG" ]]; then
+    mkdir -p "$(dirname "$SESSION_LOG")" 2>/dev/null || true
+    $PODMAN logs "$PROXY_NAME" >"$SESSION_LOG" 2>/dev/null || true
+  fi
+
   $PODMAN rm "$PROXY_NAME" >/dev/null 2>&1 || true
   $PODMAN network rm "$NET_NAME" >/dev/null 2>&1 || true
   rm -f "$RESOLV_CONF"
+  rm -rf "$POLICY_DIR"
 }
 
 # Hent tilbake ressurser fra avbrutte kjør: døde sbx-* containere og ubrukte
@@ -70,6 +82,9 @@ sbx_reap_orphans() {
   find "$STATE_DIR" -maxdepth 1 \
     \( -name 'resolv-*.conf' -o -name 'allowlist-*.txt' \) -mmin +60 -delete \
     >/dev/null 2>&1 || true
+  # Stale per-session proxy policy dirs (crashed sessions).
+  find "$STATE_DIR" -maxdepth 1 -type d -name 'proxy-*' -mmin +60 \
+    -exec rm -rf -- {} + >/dev/null 2>&1 || true
 }
 
 image_exists() { $PODMAN image inspect "$1" >/dev/null 2>&1; }
@@ -113,6 +128,160 @@ for link in data:
     echo "$out" | tr ' ' '\n' | grep -vE '^(127\.|::1$)' && return 0
   fi
   return 1
+}
+
+# ------------------------------------------------------------ proxy policy
+# Generate Smokescreen's per-session config under $1 (mounted ro at /config
+# in the proxy container):
+#   proxy.yaml — main config (port, ACL path, idle timeout, port-scoped
+#                allow_addresses exceptions)
+#   acl.yaml   — egress ACL (default action + allowed_domains)
+#
+# Semantics:
+#  - allow_missing_role: true — no mTLS in the sandbox, so role "" matches
+#    no service and the ACL's default rule applies to every client.
+#  - open mode → default action open: the ACL allows everything and
+#    Smokescreen's built-in IP filter still denies private/loopback/
+#    link-local/CGNAT/metadata/IPv6-embedded. No port restriction for
+#    domain destinations — Smokescreen's ACL has no port dimension,
+#    same as the old proxy.py open mode.
+#  - enforce mode → default action enforce with the merged allowlist as
+#    allowed_domains.
+#  - The trusted host (model server base_url port + -H ports) is a
+#    port-scoped exception: 169.254.1.2 is the pasta link-local host
+#    address (host.containers.internal) which the IP filter denies by
+#    default, so allow_addresses opens just the listed ports — never
+#    all ports. In enforce mode the hostname also goes into
+#    allowed_domains so the ACL accepts it.
+#
+# Allowlist entries (unchanged user-facing format): host, *.wildcard,
+# IP, IP:port, [IPv6]:port. Two semantic differences from proxy.py:
+#  - hostname:port loses its port scoping (the ACL has no port dimension;
+#    the entry grants the host on all ports, subject to the IP filter);
+#  - wildcards *.x match only subdomains of x, not x itself.
+sbx_write_proxy_policy() {
+  local out="$1"
+  command -v python3 >/dev/null 2>&1 \
+    || { echo "error: python3 not found; cannot generate the proxy policy." >&2; return 1; }
+  python3 - "$MERGED" "$SBX_OPEN_NETWORK" "$PROXY_TRUSTED" "$out" "$PROXY_PORT" <<'PY'
+import ipaddress, re, sys
+
+merged, open_mode, trusted_csv, outdir, port = sys.argv[1:6]
+
+def warn(msg):
+    print(f"warn: proxy policy: {msg}", file=sys.stderr)
+
+acl_entries = []
+allow_addresses = []
+allow_ranges = []
+
+def add_acl(entry):
+    if entry not in acl_entries:
+        acl_entries.append(entry)
+
+HOST_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$')
+
+def valid_host(h):
+    return bool(HOST_RE.match(h))
+
+for raw in open(merged):
+    line = raw.strip()
+    if not line or line.startswith('#'):
+        continue
+    host, portno = None, None
+    m = re.match(r'^\[(.+)\]:(\d{1,5})$', line)      # [IPv6]:port
+    if m:
+        host, portno = m.group(1), int(m.group(2))
+    elif line.count(':') == 1:
+        host, port_s = line.rsplit(':', 1)
+        portno = int(port_s) if port_s.isdigit() else None
+    else:
+        host = line
+
+    ip = None
+    try:
+        if portno is not None and not (1 <= portno <= 65535):
+            raise ValueError
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if portno is not None:
+            # host:port — no port dimension for domains in Smokescreen:
+            # keep the host, warn about the scoping difference.
+            if host.startswith('*.'):
+                warn(f"'{line}': wildcards with ports are unsupported — skipped")
+                continue
+            if not valid_host(host):
+                warn(f"'{line}': not a hostname, IP, or [IPv6]:port — skipped")
+                continue
+            warn(f"'{line}': host:port entries grant the host on all ports "
+                 "(Smokescreen ACL has no port dimension)")
+        else:
+            is_wild = host.startswith('*.') and valid_host(host[2:])
+            if not is_wild and not valid_host(host):
+                warn(f"'{line}': not a hostname, wildcard, or IP — skipped")
+                continue
+
+    if ip is not None:
+        # IP literal: needs an ACL entry plus an IP-filter exception
+        # (loopback/link-local/private are denied by default).
+        add_acl(str(ip))
+        if portno is not None:
+            allow_addresses.append(f"{ip}:{portno}")
+        else:
+            allow_ranges.append(f"{ip}/{'128' if ip.version == 6 else '32'}")
+    elif host is not None:
+        add_acl(host)
+
+# Trusted host: port-scoped exception (model server + -H ports).
+for t in (x for x in trusted_csv.split(',') if x.strip()):
+    t = t.strip()
+    name, _, p = t.rpartition(':')
+    if name != 'host.containers.internal' or not p.isdigit() or not (1 <= int(p) <= 65535):
+        warn(f"trusted entry '{t}': expected host.containers.internal:PORT — skipped")
+        continue
+    if f"169.254.1.2:{p}" not in allow_addresses:
+        allow_addresses.append(f"169.254.1.2:{p}")
+    if open_mode != '1':
+        add_acl(name)
+
+def ylist(items, indent):
+    # Quote every item: an unquoted *.glob is a YAML alias indicator and an
+    # unquoted IPv6 literal is ambiguous; validated hosts/IPs never contain
+    # quote characters.
+    return "\n".join(f"{indent}- '{i}'" for i in items)
+
+action = "open" if open_mode == "1" else "enforce"
+acl = (
+    "version: v1\n"
+    "services: []\n"
+    "default:\n"
+    "  name: default\n"
+    "  project: harrbjorn\n"
+    f"  action: {action}\n"
+)
+if acl_entries:
+    acl += "  allowed_domains:\n" + ylist(acl_entries, "    ") + "\n"
+with open(f"{outdir}/acl.yaml", "w") as f:
+    f.write(acl)
+
+cfg = (
+    "ip: 0.0.0.0\n"
+    f"port: {port}\n"
+    "allow_missing_role: true\n"
+    "acl_file: /config/acl.yaml\n"
+    # The IdleTimeout default is unset (0); a 10m cap on idle connections
+    # mirrors the old proxy.py (CONNECT_IDLE_SECONDS=600) without cutting
+    # streaming model responses mid-body (idle = no bytes in either
+    # direction).
+    "idle_timeout: 10m\n"
+)
+if allow_addresses:
+    cfg += "allow_addresses:\n" + ylist(allow_addresses, "  ") + "\n"
+if allow_ranges:
+    cfg += "allow_ranges:\n" + ylist(allow_ranges, "  ") + "\n"
+with open(f"{outdir}/proxy.yaml", "w") as f:
+    f.write(cfg)
+PY
 }
 
 # ----------------------------------------------------------------- runtime
@@ -316,6 +485,7 @@ sbx_main() {
   NET_NAME="sbx-$S-int"
   PROXY_NAME="sbx-$S-proxy"
   SBX_NAME="sbx-$S"
+  SESSION_LOG="$STATE_DIR/logs/$S.jsonl"
   trap sbx_cleanup EXIT
 
   sbx_reap_orphans
@@ -355,6 +525,17 @@ sbx_main() {
     fi
   } | sort -u > "$MERGED"
 
+  # -------------------------------------------------------- proxy policy
+  # Smokescreen config (proxy.yaml + acl.yaml), generated from the merged
+  # allowlist + egress mode + trusted host; mounted at /config in the proxy.
+  # The allowlist keeps its user-facing format; only the generated policy
+  # is new. Generation failure aborts before any session resource leaks
+  # (the EXIT trap cleans up what exists so far).
+  local PROXY_PORT=3128
+  POLICY_DIR="$STATE_DIR/proxy-$S"
+  mkdir -p "$POLICY_DIR"
+  sbx_write_proxy_policy "$POLICY_DIR" || exit 1
+
   # ------------------------------------------------------------- proxy
   # Per-session proxy: one hop on pasta's default network (real egress +
   # host.containers.internal), one hop on the session's internal network
@@ -384,30 +565,49 @@ sbx_main() {
     --userns=keep-id:uid=1000,gid=1000 \
     --network podman --network "$NET_NAME" \
     -v "$RESOLV_CONF:/etc/resolv.conf:ro,z" \
-    -e SBX_PROXY_OPEN="$SBX_OPEN_NETWORK" \
-    ${PROXY_TRUSTED:+-e SBX_PROXY_TRUSTED="$PROXY_TRUSTED"} \
+    -v "$POLICY_DIR:/config:ro,z" \
     --read-only --tmpfs /tmp \
     --cap-drop ALL --security-opt no-new-privileges \
     --user 65534:65534 \
     --memory 256m --pids-limit 128 --ulimit nofile=65536:65536 \
-    -v "$MERGED:/allowlist/allowlist.txt:ro,z" \
-    harrbjorn/sbx-proxy:latest >/dev/null
-  # Wait until the proxy accepts connections. Probe the proxy's own startup
-  # log line, not `podman exec`: krun (microVM) does not implement exec, so
-  # an in-container connection test would fail on every krun run even when
-  # the proxy is up. Log polling works on every runtime; the line is only
-  # written after the listening socket is bound.
-  local i
-  for i in $(seq 1 20); do
-    if $PODMAN logs "$PROXY_NAME" 2>/dev/null \
-      | grep -q 'listening on 0.0.0.0:3128'; then break; fi
-    sleep 0.5
-  done
-  if $PODMAN logs "$PROXY_NAME" 2>/dev/null \
-    | grep -q 'listening on 0.0.0.0:3128'; then
+    harrbjorn/sbx-proxy:latest \
+    --config-file /config/proxy.yaml >/dev/null
+  # Wait until the proxy is ready.
+  #
+  # Probe = a throwaway container on the session's internal net that does a
+  # raw TCP connect to the proxy's IP — the exact path a sandboxed request
+  # takes, so "answered" means "will serve". The alternatives are all
+  # ruled out:
+  #   * `podman exec` in the proxy: krun (microVM) has no exec.
+  #   * polling the proxy's startup log line: krun's log channel is flaky —
+  #     the line can stay invisible for minutes while the proxy is fully
+  #     up and serving, so it cannot arbitrate.
+  #   * a host-side connect: the host cannot reach a krun container on any
+  #     network (pasta only bridges container→host, e.g. for
+  #     host.containers.internal).
+  # The helper reuses $SBX_IMAGE (already built above) — no extra image to
+  # pull — with the entrypoint overridden, so sbx-init.sh never runs. It
+  # polls for up to 90s and exits 0 on the first answered connect; the
+  # proxy normally answers in ~1s, so the common case costs one brief
+  # container start. A config/ACL that fails Validate never binds the
+  # socket, so the deadline fires and the error path below does the rest.
+  local PROXY_IP
+  PROXY_IP="$($PODMAN inspect \
+    -f "{{(index .NetworkSettings.Networks \"$NET_NAME\").IPAddress}}" "$PROXY_NAME")"
+  if [[ -n "$PROXY_IP" ]] && $PODMAN run --rm --network "$NET_NAME" \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --entrypoint bash \
+    "$SBX_IMAGE" \
+    -c 'for _ in $(seq 1 180); do (exec 3<>/dev/tcp/'"$PROXY_IP"'/3128) 2>/dev/null && exit 0; sleep 0.5; done; echo "proxy never answered on '"$PROXY_IP"':3128"; exit 1'; then
     echo ">> proxy is up"
   else
-    echo "error: proxy failed to start; check: podman logs $PROXY_NAME" >&2
+    {
+      echo "error: proxy failed to start (no answered connect to $PROXY_IP:3128 within 90s)." >&2
+      echo "--- last proxy log lines:" >&2
+      $PODMAN logs "$PROXY_NAME" 2>&1 | tail -5 >&2 || true
+      echo "  (rerun to reproduce; the proxy container is removed on exit)" >&2
+    }
     exit 1
   fi
 
@@ -455,8 +655,8 @@ sbx_main() {
     "${CONFIG_ENV[@]}" \
     -e HOME=/home/agent \
     -e LANG="$SBX_LOCALE" \
-    -e HTTP_PROXY="http://$PROXY_NAME:3128" -e http_proxy="http://$PROXY_NAME:3128" \
-    -e HTTPS_PROXY="http://$PROXY_NAME:3128" -e https_proxy="http://$PROXY_NAME:3128" \
+    -e HTTP_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e http_proxy="http://$PROXY_NAME:$PROXY_PORT" \
+    -e HTTPS_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e https_proxy="http://$PROXY_NAME:$PROXY_PORT" \
     -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1' \
     -e DISABLE_TELEMETRY=1 -e DO_NOT_TRACK=1 -e DISABLE_AUTOUPDATER=1 \
     --read-only \

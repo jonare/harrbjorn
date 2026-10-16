@@ -372,10 +372,12 @@ mkdir -p /tmp/sbx-a /tmp/sbx-b
 
 ## Begrensninger
 
-- Allowlist-håndhevingen ligger i proxy-prosessen. Mitigering: ~450 linjer
-  kun-stdlib Python, read-only, uprivilegert (uid 65534 i containeren), ingen
-  publiserte porter, kun nåbar fra sesjonens internal-nettverk. Kjernesiden
-  («kun proxy kan nås») er nettverksarkitekturens garant.
+- Allowlist-håndhevingen ligger i proxy-prosessen. Mitigering: Smokescreen
+  (stripe) — et Go-forward-proxy som er bygget til dette formålet,
+  static-binær fra pinnet release (SHA256-verifisert ved bilde-build),
+  `FROM scratch`-bilde, read-only, uprivilegert (uid 65534 i containeren),
+  ingen publiserte porter, kun nåbar fra sesjonens internal-nettverk.
+  Kjernesiden («kun proxy kan nås») er nettverksarkitekturens garant.
 - Utgang er **proxy-kun**, ikke «proxy-fremst»: rå TCP uten proxy
   feiler trygt (ingen route).
 - Åpen utgang (`SBX_OPEN_NETWORK=1`) er et bevisst default for kodeagenten:
@@ -400,9 +402,11 @@ mkdir -p /tmp/sbx-a /tmp/sbx-b
   (tmpfs-monter slipper `uid=`/`gid=`-oppsjørs — rootless
   podman avviser dem i det hele tatt.)
 - Per-sesjonstate under `.sandbox/`: sammensmeltet allowlisten, per-sesjons
-  proxy `resolv.conf`, agent-HOME per workdir+usecase (akkumuleres —
-  ryddes manuelt per key, `rm -rf .sandbox` fjerner alt). `.env` (nøkler)
-  er git-ignoreret.
+  proxy-policy (Smokescreen `proxy.yaml` + `acl.yaml`), per-sesjons proxy
+  `resolv.conf`, agent-HOME per workdir+usecase (akkumuleres — ryddes
+  manuelt per key, `rm -rf .sandbox` fjerner alt), og per-sesjons
+  audit-log fra proxyen (allow/deny-beslutninger som JSON) under
+  `logs/<session>.jsonl`. `.env` (nøkler) er git-ignoreret.
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter.
 - krun-microVM-er (default-runtime): ~90 MB minne per VM (sandbox + proxy)
