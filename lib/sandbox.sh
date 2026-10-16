@@ -53,7 +53,7 @@ sbx_cleanup() {
   # debugging — captured while the proxy container still exists.
   if [[ -n "$PROXY_NAME" && -n "$SESSION_LOG" ]]; then
     mkdir -p "$(dirname "$SESSION_LOG")" 2>/dev/null || true
-    $PODMAN logs "$PROXY_NAME" >"$SESSION_LOG" 2>/dev/null || true
+    $PODMAN logs "$PROXY_NAME" >"$SESSION_LOG" 2>&1 || true
   fi
 
   $PODMAN rm "$PROXY_NAME" >/dev/null 2>&1 || true

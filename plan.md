@@ -17,13 +17,13 @@ fra analysen. Kun lokal kjøring på Linux-laptop (Fedora).
 Løst: symlink-angrepet mot host-seedingen av agent-HOME — seeding flyttet
 fra hosten til init-steg i containeren (`code/sbx-init.sh`). Se «Relatert».
 
-## Status (per 2026-10-14)
+## Status (per 2026-10-16)
 
 | Punkt | Status |
 |---|---|
 | 1. Rootless Podman | ✅ Løst (`e35f8af` + fiks `80b2605`, `9501dd8`, `e5b3352`) |
 | 2. krun/gVisor-runtime | ✅ Løst (`eb59ba7`) — `SBX_RUNTIME` (`krun` default, `runsc`/`crun` eksplisitt), hard fail hvis valgt runtime (eller `/dev/kvm`) mangler |
-| 3. Smokescreen | ❌ Ikke løst — `proxy/proxy.py` i bruk enda (`harrbjorn/sbx-proxy` er python-bilde) |
+| 3. Smokescreen | ✅ Løst (`d2bedd9`) — `proxy/proxy.py` slettet; `harrbjorn/sbx-proxy` bygd fra pinnet Smokescreen-release (static Go-binær på scratch, uid 65534), per-sesjon policy fra `sbx_write_proxy_policy`, JSON audit-logs |
 | 4. Nettverk per sesjon | ✅ Løst sammen med 1 — per-sesjon `--internal`-nett + proxy, per-sesjon `resolv.conf`/allowlist, orphan-reaping, `-H`, ingen iptables/sudo |
 | 5. copy-in/patch-ut | ❌ Ikke løst — fortsatt rw-bindmount til `/work`; ingen `--mount-workspace`, ingen `-w`-sperre |
 
@@ -114,10 +114,27 @@ standard tidsgrense).
 - `uname -r` i containeren er en annen kjerne enn hosten (krun).
 - Self-testen fra punkt 4 består med valgt runtime.
 
-## 3. Smokescreen i stedet for `proxy/proxy.py` — ❌ IKKE LØST
+## 3. Smokescreen i stedet for `proxy/proxy.py` — ✅ LØST
 
-`proxy/proxy.py` er i bruk enda; `harrbjorn/sbx-proxy` er et python-bilde
-(`python:3.13-slim` + `proxy.py`), ikke Smokescreen.
+Implementert i `d2bedd9`: `harrbjorn/sbx-proxy` bygges fra Smokescreen
+`v0.1.0` (stripe — den eneste publiserte release; SHA256-verifisert mot
+releaseens `SHA256SUMS` ved build) — statisk Go-binær, `FROM scratch`,
+uid 65534, read-only, uprivilegert, ingen publiserte porter. Policy
+genereres per sesjon av `sbx_write_proxy_policy` i `lib/sandbox.sh` til
+`proxy.yaml` + `acl.yaml` (montert ro på `/config`); allowlisten beholder
+brukerens format. Open-modus (`SBX_OPEN_NETWORK=1`) → `action: open`
+(Smokescreens innebygde IP-filter nekter fortsatt privat/loopback/
+link-local/CGNAT/metadata); enforce-modus → `action: enforce` med
+sammensmeltet allowlist som `allowed_domains`. Tillitshost
+(modellserverport + `-H`) er et port-avskåret `allow_addresses`-unntak
+for `169.254.1.2` — aldri alle porter. JSON audit-linjer går til stderr,
+og `sbx_cleanup` fanger dem med `podman logs … 2>&1` til
+`.sandbox/logs/<session>.jsonl`.
+`proxy/proxy.py` slettet. To semantiske forskjeller fra proxy.py, notert:
+`host:port` mister port-avskjæring (ACL har ingen portdimensjon), og
+wildcard `*.x` matcher kun underdomener, ikke `x` selv. Verifisert av
+integrasjonstesten i `tests/` (happy/blokkering/bypass/uforandring),
+38/38 under både crun og krun.
 
 **Endringer**
 - Nytt bilde `harrbjorn/sbx-proxy` bygget fra pinnet Smokescreen-release
@@ -136,15 +153,21 @@ standard tidsgrense).
   med 10/8, 192.168/16, 172.29.0.1 osv.).
 - Begrens open-modus til porter 80/443 (`--allow-port`-oppsett e.l., må
   sjekkes mot Smokescreen-flaggene). Andre porter krever allowlist-oppføring.
-- Audit: Smokescreen logger JSON til stdout; `podman logs` for sesjonens
-  proxy erstatter `docker logs sbx-proxy`. Behold mulighet for å kopiere
-  loggen til `.sandbox/logs/<sesjon>.jsonl` ved avslutning.
+- Audit: Smokescreen logger JSON til stderr; `sbx_cleanup` fanger loggen
+  med `podman logs … 2>&1` til `.sandbox/logs/<sesjon>.jsonl` ved avslutning.
 
-**Avklares**
-- Eksakt mapping fra dagens port-semantikk (`host` = 80/443, `host:port`)
-  til Smokescreen-konfig.
-- Plain HTTP-forwarding og strømming (SSE) mot modellserveren over `http://`.
-  Alternativ: la modellserveren nås direkte og ikke via proxy (se punkt 4).
+**Avklart (d2bedd9)**
+- Port-semantikk: tillitshost får port-avskåret `allow_addresses`
+  (`169.254.1.2:<port>`); domener får ikke portdimensjon (Smokescreen-ACL
+  har ingen) — en `host:port`-oppføring gir hele hosten.
+- Modellserveren nås via proxyen som i punkt 4 (tillitshost, port-avskåret).
+  Smokescreen forwarder uten buffer, og testen bekrefter byte-identisk
+  pass-through (GET/POST, sha256). Langstrøm/SSE er ikke en dedikert test
+  — verifiseres mot reell modellserver ved behov.
+- Open-modus er **ikke** port-restrikt til 80/443 (avvik fra «Endringer»):
+  Smokescreens ACL har ingen portdimensjon for domener, slik som proxy.py
+  — IP-filteret (privat/loopback/link-local/CGNAT/metadata) gjelder likevel.
+  Kun IP-literaler og tillitshost er port-avskåret (`allow_ranges`/`allow_addresses`).
 
 **Verifiser (nye negative tester)**
 - Open-modus: `curl -x ... https://10.0.0.1`, `https://192.168.1.1`,
@@ -290,7 +313,7 @@ ingen copy-in, patch-ut, `--mount-workspace` eller `-w`-sperre.
 2. Punkt 1 og 4 sammen (Podman + nettverk per sesjon), med dagens
    `proxy.py` midlertidig. ✅ `e35f8af` (+ fiks `80b2605`, `9501dd8`,
    `e5b3352`); `proxy.py` er fremdeles midlertidig.
-3. Punkt 3 (Smokescreen), slett `proxy.py`. ⏳ Ikke påbegynt.
+3. Punkt 3 (Smokescreen), slett `proxy.py`. ✅ `d2bedd9`.
 4. Punkt 2 (runtime på som default). ✅ `eb59ba7`.
 5. Punkt 5 (copy-in/patch-ut). ⏳ Ikke påbegynt.
 6. Skriv om README (trusselmodell, arkitektur, self-test) og slett
@@ -301,7 +324,7 @@ ingen copy-in, patch-ut, `--mount-workspace` eller `-w`-sperre.
 ## Hva som slettes
 
 - `etc/harrbjorn-sbx.sudoers` ✅ Slettet.
-- `proxy/proxy.py` ❌ Eksisterer fremdeles (avventer punkt 3).
+- `proxy/proxy.py` ✅ Slettet (`d2bedd9`).
 - iptables-, bridge-, sudo-docker- og label-hash-logikken i `lib/sandbox.sh`
   ✅ Fjernet.
 - `HOST_ISOLATION`, `SBX_HOST_PORTS`, `--no-host-isolation` ✅ Fjernet
