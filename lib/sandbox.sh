@@ -400,7 +400,9 @@ sbx_main() {
   # it is a runtime exception, never a user allowlist entry. Only `export ...`
   # lines are evaluated, so the file's comments and trailing `claude ...`
   # invocation are ignored. The result is injected as env vars, standalone;
-  # no file is mounted into the container.
+  # no file is mounted into the container. The container's claude reads them
+  # directly; sbx-init.sh derives pi's models.json/settings.json from the
+  # same vars, so both harnesses share the model.
   local SBX_CLAUDE_CONFIG="${SBX_CLAUDE_CONFIG:-$HOME/claude.sh}"
   local cfg_exports cfg_env cfg_url cfg_rest cfg_port
   if [[ -f "$SBX_CLAUDE_CONFIG" ]]; then
@@ -659,6 +661,7 @@ sbx_main() {
     -e HTTPS_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e https_proxy="http://$PROXY_NAME:$PROXY_PORT" \
     -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1' \
     -e DISABLE_TELEMETRY=1 -e DO_NOT_TRACK=1 -e DISABLE_AUTOUPDATER=1 \
+    -e PI_TELEMETRY=0 -e PI_SKIP_VERSION_CHECK=1 \
     --read-only \
     --tmpfs /tmp:size=1g,mode=1777 \
     --tmpfs /var/tmp:size=256m,mode=1777 \
@@ -666,4 +669,6 @@ sbx_main() {
     --pids-limit "$SBX_PIDS" --memory "$SBX_MEMORY" --cpus "$SBX_CPUS" \
     --ulimit nofile=65536:65536 \
     "$SBX_IMAGE" "${CMD[@]}"
+  # (PI_*: same intent for pi — no install telemetry, no pi.dev version check;
+  #  model-catalog refreshes stay possible and go through the proxy.)
 }

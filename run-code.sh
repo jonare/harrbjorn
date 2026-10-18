@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-code.sh — kodeagent-sandbox: dev-miljø + Claude Code CLI.
+# run-code.sh — kodeagent-sandbox: dev-miljø + agent-CLIer (claude, pi).
 #
 # Usage:
 #   harrbjorn code [-w <workdir>] [-a host[:port]]... [-H port]...
@@ -30,6 +30,8 @@
 #   (containernens claude kjører med bypassPermissions som default — ingen
 #    --dangerously-skip-permissions-flagg nødvendig)
 #   harrbjorn code -w ~/proj claude         # annen workdir enn cwd
+#   harrbjorn code pi                       # interaktiv pi i cwd (samme modellkonfig som claude)
+#   harrbjorn code pi -p "Fix the failing tests"
 #
 # Isolasjonslag (rootless podman, ingen sudo; hvert holder selv hvis ett feiler):
 #   1. sandbox kjører kun på sesjonens internal-nett (ingen direkte utgang)
@@ -39,7 +41,7 @@
 #   5. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
 
 set -euo pipefail
-sbx_usage() { sed -n '2,39p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,41p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code

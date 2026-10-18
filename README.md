@@ -5,14 +5,14 @@
 
 ## Oppsett
 
-Et rootless Podman-oppsett der agenter (Claude Code CLI) kan kjøre autonomt mot
+Et rootless Podman-oppsett der agenter (Claude Code CLI, pi) kan kjøre autonomt mot
 en bind-mounted workspace, uten å kunne skade hostsystemet. Ingen sudo noe
 sted — hele isolasjonen kjører i brukerens rootless netns/userns. Én CLI
 (`harrbjorn`), to usecases, hver med sitt oppstartsscript og sitt bilde:
 
 | Usecase | CLI | Wrapper | Bilde | Tooling |
 |---|---|---|---|---|
-| Kodeagent | `harrbjorn code` | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, åpen nettverksutgang som standard |
+| Kodeagent | `harrbjorn code` | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, claude + pi, åpen nettverksutgang som standard |
 | Sikkerhetstesting | `harrbjorn security` | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb; mål legges til med `-a` ved kjør |
 
 Isolasjonskjernen (per-sesjon nett, proxy, host-isolasjon via proxy-policy,
@@ -50,6 +50,12 @@ containeren når hostens modellserver via det riktige grensesnittet. Configen
 injiseres som env-vars i containeren (standalone) — ingen fil monteres inn.
 Kun `export ...`-linjene leses, så filens kommentarer og avsluttende
 `claude`-kommando ignoreres.
+
+Bildets init-steg (`code/sbx-init.sh`) avleder **pi**-modellkonfigen
+(`~/.pi/agent/models.json` + `settings.json`) fra de samme env-varene, så
+begge agent-CLI-ene (claude, pi) peker på samme modellserver, nøkkel og
+modell. Nøkkelen ligger aldri som tekst i `models.json` — den refereres med
+env-interpolering (`${ANTHROPIC_API_KEY}`).
 
 Porten i base-URL-en parsest ut og gjøres til en **trusted upstream** i
 proxyens policy (`SBX_PROXY_TRUSTED`) — et runtime-unntak som slår over
@@ -118,7 +124,10 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
    modelconfigens API-key approvet og permission-mode til `bypassPermissions`
    (containernens claude kjører altså uten `--dangerously-skip-permissions`-flagg;
    gjelder KUN denne user-level-configen i agent-HOME — hostens `~/.claude`
-   røres ikke), slik at first-run-vizarden ikke vises),
+   røres ikke), slik at first-run-vizarden ikke vises; den skriver i tillegg
+   pi-modellkonfig (`~/.pi/agent/models.json` + `settings.json`) fra de samme
+   env-varene som claude, slik at pi bruker samme modellserver/nøkkel/modell
+   (nøkkelen kun som `${ANTHROPIC_API_KEY}`-interpolering — aldri som tekst),
    pids/memory/cpu-limit.
 5. **MicroVM via krun** (default-runtime) — sandboxen (og proxyen) kjører
    som microVM-er på KVM: eget kernel, egne prosesser, eget /tmp. En
@@ -172,7 +181,7 @@ Flagg (identiske i begge):
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). Bare relevant i allowlist-modus. |
 | `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream. Den eneste veien til hosten — se [Host-tjenester](#host-tjenester). |
 | `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). Bare relevant i allowlist-modus. |
-| `--rebuild` | Bygg bilder + proxy på nytt (Claude Code-låses ved build; se Begrensninger). |
+| `--rebuild` | Bygg bilder + proxy på nytt (claude/pi låses ved build; se Begrensninger). |
 
 Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
 
@@ -199,8 +208,9 @@ harrbjorn code
 # Interaktiv Claude Code-sesjon i et prosjekt
 cd ~/proj && harrbjorn code claude
 
-# Énkjørs-agenter
+# Énkjørs-agenter (pi: samme modellkonfig som claude)
 harrbjorn code -w ~/proj claude -p "Refaktoriser auth-modulen"
+harrbjorn code -w ~/proj pi -p "Refaktoriser auth-modulen"
 ```
 
 Eksempler — sikkerhetstesting (målene ligger IKKE i default-allowlisten,
@@ -210,9 +220,11 @@ legges til med `-a` ved kjør):
 # Interaktiv bash i gjeldende workdir (default — ingen kommando)
 harrbjorn security
 
-# agent-drevet pentest (i målets workspace)
+# agent-drevet pentest (i målets workspace; pi: samme modellkonfig som claude)
 harrbjorn security -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
   claude -p "Portscan og test 192.168.50.10"
+harrbjorn security -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
+  pi -p "Portscan og test 192.168.50.10"
 
 # direkte verktøy (HTTP-vedkommende verktøy kun — se Begrensninger)
 harrbjorn security -w ~/pentest -a 192.168.50.10:8080 curl -sI http://192.168.50.10:8080/
@@ -343,6 +355,9 @@ SBX_RUNTIME=runsc ./run-code.sh -w /tmp/sbx-test -- sh -c 'true' 2>&1 \
 ./run-code.sh -w /tmp/sbx-test -- claude -p "Svar bare: OK"
 # (containernens claude kjører med bypassPermissions som default — se
 # «Container-hardening»; ingen --dangerously-skip-permissions nødvendig)
+./run-code.sh -w /tmp/sbx-test -- pi -p "Svar bare: OK"
+# (pi bruker models.json-configurationen som sbx-init.sh avleder fra
+# modelconfigens env-vars — samme modellserver/nøkkel/modell som claude)
 ```
 
 Pentest-variant (mål i allowlisten via `-a`, dev-hosts skal være borte):
@@ -393,8 +408,8 @@ mkdir -p /tmp/sbx-a /tmp/sbx-b
 - Tre bilder: `harrbjorn/code:latest`, `harrbjorn/pentest:latest` (bygges
   `FROM` code, så code bygges alltid først) og `harrbjorn/sbx-proxy:latest`.
   Bildene bygges automatisk ved første kjør og med `--rebuild`.
-- Claude Code-versjonen låses ved bilde-build (auto-update er slått av);
-  gjelder begge sandbox-bildene — bygg på nytt med `--rebuild` for
+- Claude Code- og pi-versjonene låses ved bilde-build (auto-update er slått
+  av); gjelder begge sandbox-bildene — bygg på nytt med `--rebuild` for
   oppdateringer.
 - keep-id user-namespace: containerens uid 1000 = hostens uid 1000, så
   workspace-filer eies av hostbrukeren utenfor. Kjøres hostbrukeren under

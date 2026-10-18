@@ -1,5 +1,5 @@
-# harrbjorn code-agent sandbox: dev environment + Claude Code CLI for
-# autonomous code agents. Intended to run with:
+# harrbjorn code-agent sandbox: dev environment + agent CLIs (Claude Code,
+# pi) for autonomous code agents. Intended to run with:
 # --read-only --cap-drop ALL --security-opt no-new-privileges,
 # non-privileged user 1000, tmpfs /tmp /var/tmp /home/agent (see lib/sandbox.sh).
 # Base image pinned by digest; re-pin when the node line moves.
@@ -28,7 +28,8 @@ RUN apt-get update \
         zip \
         locales \
  && rm -rf /var/lib/apt/lists/* \
- && npm install -g @anthropic-ai/claude-code@2.1.296
+ && npm install -g @anthropic-ai/claude-code@2.1.296 \
+ && npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0
 
 # The base image ships only the POSIX/C locale (LC_CTYPE=POSIX, single-byte),
 # which mis-handles the multi-byte UTF-8 a Norwegian keyboard emits for
@@ -44,8 +45,8 @@ ENV LANG=nb_NO.UTF-8
 # sandbox user has a stable name regardless of the base image's choice.
 RUN usermod -l agent -d /home/agent -m node
 
-# Init step: pre-seeds $HOME with Claude Code state before exec'ing the
-# command (see sbx-init.sh). Seeding happens inside the container, never on
+# Init step: pre-seeds $HOME with Claude Code and pi state before exec'ing
+# the command (see sbx-init.sh). Seeding happens inside the container, never
 # the host: between runs the agent owns the agent-HOME bind mount and can
 # plant symlinks in it, which a host-side seeder would follow.
 COPY sbx-init.sh /usr/local/bin/sbx-init.sh
