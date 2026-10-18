@@ -31,6 +31,22 @@ RUN apt-get update \
  && npm install -g @anthropic-ai/claude-code@2.1.296 \
  && npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0
 
+# Pi extensions baked into the image: a space-separated list of pi package
+# sources (npm:..., git:github.com/..., or plain npm package names). They are
+# installed at build time straight into /usr/local/share/pi/agent/npm via
+# PI_CODING_AGENT_DIR (no throwaway HOME + relocate: a cross-directory
+# rename on this stack intermittently fails with ENOENT). The container
+# filesystem is read-only at runtime, so that store stays pristine;
+# /home/agent is a bind mount and the baked store never reaches the agent
+# home directly — sbx-init.sh copies it into $HOME/.pi/agent/npm on each run,
+# merging into any store the agent already has (the image is the source of
+# truth: extensions the agent removed are re-seeded on the next run, like the
+# model config). To add an extension, append it here, rebuild, and commit the
+# new image digest.
+ARG PI_EXTENSIONS=npm:pi-subagents
+RUN for src in $PI_EXTENSIONS; do PI_CODING_AGENT_DIR=/usr/local/share/pi/agent pi install "$src"; done \
+ && rm -rf /root/.npm /root/.pi
+
 # The base image ships only the POSIX/C locale (LC_CTYPE=POSIX, single-byte),
 # which mis-handles the multi-byte UTF-8 a Norwegian keyboard emits for
 # å/ø/æ in interactive mode. Generate a Norwegian UTF-8 locale plus a neutral

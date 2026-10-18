@@ -11,7 +11,7 @@
 set -u
 
 python3 - <<'PYEOF' || echo "warn: failed to pre-seed agent HOME; first-run wizard will appear." >&2
-import json, os, sys
+import json, os, shutil, sys
 
 # HOME is set by the wrapper (-e HOME=/home/agent); the model config arrives
 # via the same env the container's claude uses.
@@ -102,6 +102,69 @@ if base_url and model:
     # on the next run by design. Other keys are merged, never replaced.
     psd["defaultProvider"] = provider_id
     psd["defaultModel"] = model
+    with open(ps, "w") as f: json.dump(psd, f, indent=2)
+
+# ------------------------------------------------------- pi extensions
+# The image bakes operator-chosen extension packages (Dockerfile
+# PI_EXTENSIONS) into a read-only store at /usr/local/share/pi/agent/npm.
+# The container FS is read-only and /home/agent a bind mount, so that store
+# never appears at runtime: seed it into $HOME/.pi/agent/npm here.
+#
+# The store is an npm project and pi's `npm install` builds its ideal tree
+# from the store's package.json, pruning node_modules entries that are not
+# listed there — so when merging into a store the agent already has, the
+# baked direct dependencies must be merged into the local package.json too
+# (setdefault: the agent's own specifiers win, e.g. after `pi update`).
+# As with the model config above, the image is the source of truth: an
+# extension the agent removed is re-seeded on the next run.
+ext = os.path.join("/usr/local/share/pi", "agent", "npm")
+ext_nm = os.path.join(ext, "node_modules")
+if os.path.isdir(ext_nm) and os.listdir(ext_nm):
+    with open(os.path.join(ext, "package.json")) as f:
+        ext_baked = json.load(f)
+    store_nm = os.path.join(home, ".pi", "agent", "npm", "node_modules")
+    os.makedirs(store_nm, exist_ok=True)
+    spj = os.path.join(home, ".pi", "agent", "npm", "package.json")
+    try:
+        with open(spj) as f: sp = json.load(f)
+    except (FileNotFoundError, ValueError):
+        sp = {"name": "pi-extensions", "private": True}
+    for name, spec in ext_baked.get("dependencies", {}).items():
+        sp.setdefault("dependencies", {}).setdefault(name, spec)
+    tmp = spj + ".tmp"
+    with open(tmp, "w") as f: json.dump(sp, f, indent=2)
+    os.replace(tmp, spj)
+    for entry in sorted(os.listdir(ext_nm)):
+        if entry.startswith("."):
+            continue
+        src = os.path.join(ext_nm, entry)
+        if not os.path.isdir(src):
+            continue
+        if entry.startswith("@"):
+            # Symlink-safe: copy each scoped package individually.
+            for sub in sorted(os.listdir(src)):
+                sub_src = os.path.join(src, sub)
+                sub_dst = os.path.join(store_nm, entry, sub)
+                if os.path.isdir(sub_src) and not os.path.exists(sub_dst):
+                    os.makedirs(os.path.dirname(sub_dst), exist_ok=True)
+                    shutil.copytree(sub_src, sub_dst)
+        elif not os.path.exists(os.path.join(store_nm, entry)):
+            shutil.copytree(src, os.path.join(store_nm, entry))
+    lock = os.path.join(home, ".pi", "agent", "npm", "package-lock.json")
+    if not os.path.exists(lock):
+        baked_lock = os.path.join(ext, "package-lock.json")
+        if os.path.exists(baked_lock):
+            shutil.copy(baked_lock, lock)
+    ps = os.path.join(home, ".pi", "agent", "settings.json")
+    try:
+        with open(ps) as f: psd = json.load(f)
+    except (FileNotFoundError, ValueError):
+        psd = {}
+    pkgs = psd.setdefault("packages", [])
+    for name in ext_baked.get("dependencies", {}):
+        spec = "npm:" + name
+        if spec not in pkgs:
+            pkgs.append(spec)
     with open(ps, "w") as f: json.dump(psd, f, indent=2)
 PYEOF
 

@@ -57,6 +57,18 @@ begge agent-CLI-ene (claude, pi) peker på samme modellserver, nøkkel og
 modell. Nøkkelen ligger aldri som tekst i `models.json` — den refereres med
 env-interpolering (`${ANTHROPIC_API_KEY}`).
 
+**pi-extensions** bakes inn i bildet: `code/Dockerfile` tar env-argumentet
+`PI_EXTENSIONS` (mellomromskoddet liste av pi-pakkessilder, f.eks.
+`npm:pi-subagents`) og installerer dem ved build til det skrivebeskyttede
+`/usr/local/share/pi/agent/npm`. `/home/agent` er en bindmount, så den
+bakede store-en når aldri agent-HOME direkte — init-steget kopyerer den til
+`~/.pi/agent/npm` ved hver kjør og smelter den sammen med eventuell
+eksisterende store (både node_modules og storens `package.json`, slik at
+pi-egne `npm install`-kjør ikke pruner de bakede pakker). Bildet er
+source of truth: en extension agenten fjerner seedes på nytt ved neste
+kjør, lik modell-konfigen. Tillegg: legg til kilden i `PI_EXTENSIONS`,
+bygg på nytt (`--rebuild`).
+
 Porten i base-URL-en parsest ut og gjøres til en **trusted upstream** i
 proxyens policy (`SBX_PROXY_TRUSTED`) — et runtime-unntak som slår over
 alt-avvis-settet og DNS-rebinding-vernet, aldri en allowlistpost. Bytter du
@@ -128,7 +140,9 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
    pi-modellkonfig (`~/.pi/agent/models.json` + `settings.json`) fra de samme
    env-varene som claude, slik at pi bruker samme modellserver/nøkkel/modell
    (nøkkelen kun som `${ANTHROPIC_API_KEY}`-interpolering — aldri som tekst),
-   pids/memory/cpu-limit.
+   og kopyerer de bakede pi-extensions fra
+   `/usr/local/share/pi/agent/npm` til `~/.pi/agent/npm`
+   (se «Model-backend» over); pids/memory/cpu-limit.
 5. **MicroVM via krun** (default-runtime) — sandboxen (og proxyen) kjører
    som microVM-er på KVM: eget kernel, egne prosesser, eget /tmp. En
    container-escape lander da i VMens user-namespace, ikke på
@@ -410,7 +424,10 @@ mkdir -p /tmp/sbx-a /tmp/sbx-b
   Bildene bygges automatisk ved første kjør og med `--rebuild`.
 - Claude Code- og pi-versjonene låses ved bilde-build (auto-update er slått
   av); gjelder begge sandbox-bildene — bygg på nytt med `--rebuild` for
-  oppdateringer.
+  oppdateringer. Pi-extensions følger samme lås: listen står i
+  `code/Dockerfile` (`PI_EXTENSIONS`) og endres ved rebuild; agenten kan
+  installere/oppdatere egne pakker i agent-HOME mellom kjør (`pi install`/
+  `pi update`), men bakede pakker seedes på nytt ved hver kjør.
 - keep-id user-namespace: containerens uid 1000 = hostens uid 1000, så
   workspace-filer eies av hostbrukeren utenfor. Kjøres hostbrukeren under
   et annet uid, juster `--userns=keep-id` og `--user` i `lib/sandbox.sh`.
