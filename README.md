@@ -103,6 +103,13 @@ label-hash-sammenligning. Ressursene fjernes automatisk ved avslutning
 (EXIT-trapp), og foreldreløse `sbx-*`-containere/nettverk fra avbrutte kjør
 ryddes ved neste oppstart.
 
+Variante — ekstern proxy (`-p`): sesjonsnettverket lages **uten**
+`--internal`, og harrbjorns egen proxy (bilde, allowlist, policy, audit-logg)
+startes ikke i det hele tatt. I stedet peker containerens `HTTP(S)_PROXY` på
+den eksterne forward-proxyen (f.eks. Burp Suite), som da er den eneste
+utgang **og** firevallen — harrbjorn håndhever bare fail-closed-startsjekken
+(se [Ekstern proxy](#ekstern-proxy--p)).
+
 Isolasjonslag — hvert holder selv hvis ett feiler:
 
 1. **Per-sesjon internal-nettverk** (rootless netavark) — kjernepolitikk:
@@ -110,7 +117,8 @@ Isolasjonslag — hvert holder selv hvis ett feiler:
    i brukerens rootless netns, og gatewayen er ikke hostens nettverksstack —
    verken gateway-IP-hulet fra docker-æraen eller noen iptables-kjede trengs
    (se [Host-isolasjon](#host-isolasjon)). Verktøy som ignorerer
-   proxy-env-vars feiler trygt.
+   proxy-env-vars feiler trygt. Unntak: `-p` — den eksterne forward-proxyen
+   er utgangen i stedet (se [Ekstern proxy](#ekstern-proxy--p)).
 2. **Proxy-utgang** — eneste utgang; kodeagent har åpen utgang som standard
    (`SBX_OPEN_NETWORK=1`), sikkerhetstesting håndhever host(:port)-allowlisten.
    Åpen modus: permanent-avvis-settet (loopback, 0/8, 169.254/16) og
@@ -195,6 +203,7 @@ Flagg (identiske i begge):
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). Bare relevant i allowlist-modus. |
 | `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream. Den eneste veien til hosten — se [Host-tjenester](#host-tjenester). |
 | `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten). Bare relevant i allowlist-modus. |
+| `-p host:port` | Ekstern forward-proxy som utgang (f.eks. Burp Suite på `127.0.0.1:4321`). Harrbjorns egen proxy startes ikke; den eksterne proxyen er firevallen. Fail-closed — se [Ekstern proxy](#ekstern-proxy--p). |
 | `--rebuild` | Bygg bilder + proxy på nytt (claude/pi låses ved build; se Begrensninger). |
 
 Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
@@ -225,6 +234,9 @@ cd ~/proj && harrbjorn code claude
 # Énkjørs-agenter (pi: samme modellkonfig som claude)
 harrbjorn code -w ~/proj claude -p "Refaktoriser auth-modulen"
 harrbjorn code -w ~/proj pi -p "Refaktoriser auth-modulen"
+
+# Via ekstern proxy (Burp på 127.0.0.1:4321; dens CA auto-installas)
+harrbjorn code -p 127.0.0.1:4321 claude -p "Test via Burp"
 ```
 
 Eksempler — sikkerhetstesting (målene ligger IKKE i default-allowlisten,
@@ -244,6 +256,9 @@ harrbjorn security -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
 harrbjorn security -w ~/pentest -a 192.168.50.10:8080 curl -sI http://192.168.50.10:8080/
 harrbjorn security -w ~/pentest -a 192.168.50.10:8080 \
   sqlmap --proxy http://sbx-pentest-<ts>-<pid>-proxy:3128 -u "http://192.168.50.10:8080/admin" --batch
+
+# Via ekstern proxy (Burp): firewall-logikken i Burp, ikke i harrbjorn
+harrbjorn security -p 127.0.0.1:4321 claude -p "Test målet via Burp"
 ```
 
 Utgress-audit:
@@ -309,6 +324,45 @@ curl http://host.containers.internal:8000/v1/models   # OK (modellserver, auto-t
 curl --max-time 5 http://host.containers.internal:22/ # 502 (link-local, aldri i allowlist)
 ```
 
+## Ekstern proxy (`-p`)
+
+`-p host:port` sender containerens utgang gjennom en ekstern
+forward-proxy (f.eks. Burp Suite på `127.0.0.1:4321`) i stedet for
+harrbjorns egen proxy:
+
+- **Firewall-logikken er den eksterne proxyens jobb** — harrbjorns egen
+  proxy (Smokescreen) startes ikke: ingen allowlist, ingen policy-fil,
+  ingen harrbjorn-audit-logg (den eksterne proxyens egen logging er
+  trafikk-loggen). Trafikk den eksterne proxyen ikke godkjenner, kommer
+  ikke gjennom; harrbjorn har ingenting å håndheve. `-a`, `-f` og `-H`
+  har ingen effekt (wrapperen advarer).
+- **Fail-closed** — før noe sesjonsressurs lages, TCP-prober wrapperen
+  `host:port` fra hosten (timeout 5 s). Svarer ingenting: hard feil,
+  sesjonen startes ikke — ingen fallback til harrbjorns proxy, ingen åpen
+  utgang, ingen no-proxy-drift.
+- **Sesjonsnettverk med reell egress** — per-sesjons-nettverket lages
+  uten `--internal` (containeren må nå den eksterne proxyen; loopback
+  rewrites til `host.containers.internal`). Bevisst trade-off: isolasjonslag
+  1 (rå socket uten route) erstattes av den eksterne proxyen som den
+  eneste kontrollerte utgangen — HTTP(S)-kjente verktøy (curl, git, npm,
+  agent-CLIene) går via `HTTP(S)_PROXY` til den eksterne proxyen, som
+  samtidig ser og kan logger/MITM-sjekke alt.
+- **Burp CA auto-installas** — svarer porten med et parsbart X.509-sertifikat
+  på `http://<proxy>/cert` (Burp Suites selvsignerte CA), henter init-steget
+  i containeren (`code/sbx-init.sh`) det (direkte, `--noproxy`), slår det
+  sammen med system-CA-storen og exporterer resultatet som
+  `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS`. Rootfs er
+  read-only, så ligger bunken i agent-HOME
+  (`~/.sbx-ca-bundle.pem`, 0600) og hentes på nytt hver kjør — CEn tillites
+  aldri stå stasjonær, og agenten kan ikke plante en egen. Serveres det
+  ingen CA (non-Burp-forward-proxy), skippes dette stillferdig.
+
+```bash
+# Burp lytter på *:4321 (targets godkjennes i Burp selv):
+harrbjorn code -p 127.0.0.1:4321 claude -p "Test via Burp"
+harrbjorn security -p 127.0.0.1:4321 claude -p "Test målet via Burp"
+```
+
 ## Host-isolasjon
 
 Docker-oppsettet behøvde en sudo-iptables-kjede mot gateway-IP-hulet til
@@ -372,6 +426,17 @@ SBX_RUNTIME=runsc ./run-code.sh -w /tmp/sbx-test -- sh -c 'true' 2>&1 \
 ./run-code.sh -w /tmp/sbx-test -- pi -p "Svar bare: OK"
 # (pi bruker models.json-configurationen som sbx-init.sh avleder fra
 # modelconfigens env-vars — samme modellserver/nøkkel/modell som claude)
+
+# -p: ekstern proxy — fail-closed hvis porten ikke svarer (ingen sesjon, ingen fallback)
+./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:9 -- sh -c 'true' 2>&1 \
+  | grep -F 'error: -p: no forward proxy answering'   # → match (exit 1)
+
+# -p: working path (Burp lytter på *:4321)
+./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:4321 -- sh -c '
+  echo "$HTTP_PROXY"                     # → http://host.containers.internal:4321
+  ls -l ~/.sbx-ca-bundle.pem 2>/dev/null # → 0600, system-CAs + Burp CA
+  curl -sI https://example.com | head -1 # → OK (TLS via Burp CA)
+'
 ```
 
 Pentest-variant (mål i allowlisten via `-a`, dev-hosts skal være borte):
@@ -408,7 +473,10 @@ mkdir -p /tmp/sbx-a /tmp/sbx-b
   ingen publiserte porter, kun nåbar fra sesjonens internal-nettverk.
   Kjernesiden («kun proxy kan nås») er nettverksarkitekturens garant.
 - Utgang er **proxy-kun**, ikke «proxy-fremst»: rå TCP uten proxy
-  feiler trygt (ingen route).
+  feiler trygt (ingen route). Unntak: `-p` — sesjonsnettverket har da
+  reell egress, og den eksterne proxyen er firevallen (se
+  [Ekstern proxy](#ekstern-proxy--p)); der er proxyens egen logging den
+  eneste trafikk-loggen (harrbjorn-audit-loggen gjelds ikke).
 - Åpen utgang (`SBX_OPEN_NETWORK=1`) er et bevisst default for kodeagenten:
   all trafikk logges fortsatt, permanent-avvis-settet (loopback, 0/8,
   169.254/16), DNS-rebinding-vern og container-hardening holder likevel.

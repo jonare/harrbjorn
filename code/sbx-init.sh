@@ -168,6 +168,39 @@ if os.path.isdir(ext_nm) and os.listdir(ext_nm):
     with open(ps, "w") as f: json.dump(psd, f, indent=2)
 PYEOF
 
+# ---------------------------------------------------------- Burp CA (-p)
+# With -p the external proxy is the egress; when it is Burp Suite, every
+# CONNECT through it fails TLS verification unless Burp's self-signed CA is
+# trusted. Burp serves it at http://<proxy>/cert (DER-encoded; PEM accepted
+# too). The rootfs is read-only, so the CA is installed as a combined bundle
+# (system store + proxy CA) in $HOME, fresh on every run — the file lives in
+# agent-controlled storage and is never trusted stale. The fetch bypasses
+# the proxy env (--noproxy): the endpoint is served by the listener itself,
+# and sending it through the proxy would loop. Any failure (no -p, no
+# answer, not a certificate) is a silent skip: a non-Burp external proxy
+# needs no CA, and the wrapper already proved the port answers (fail-closed).
+if [ -n "${SBX_EXTERNAL_PROXY:-}" ]; then
+    bundle="$HOME/.sbx-ca-bundle.pem"
+    derfile="$(mktemp /tmp/sbx-ca.XXXXXX 2>/dev/null || true)"
+    if [ -n "$derfile" ] && curl -fsS --noproxy '*' --max-time 10 \
+        -o "$derfile" "${SBX_EXTERNAL_PROXY%/}/cert" 2>/dev/null; then
+        pemfile="$(mktemp /tmp/sbx-cacert.XXXXXX 2>/dev/null || true)"
+        if [ -n "$pemfile" ] \
+           && { openssl x509 -inform DER -in "$derfile" -out "$pemfile" 2>/dev/null \
+                || openssl x509 -inform PEM -in "$derfile" -out "$pemfile" 2>/dev/null; } \
+           && cat /etc/ssl/certs/ca-certificates.crt "$pemfile" > "$bundle" 2>/dev/null; then
+            chmod 0600 "$bundle"
+            export SSL_CERT_FILE="$bundle"
+            export REQUESTS_CA_BUNDLE="$bundle"
+            export NODE_EXTRA_CA_CERTS="$bundle"
+            echo ">> Burp CA installed from ${SBX_EXTERNAL_PROXY%/}/cert (SSL_CERT_FILE=$bundle)" >&2
+        fi
+        rm -f "$derfile" "${pemfile:-}"
+    else
+        rm -f "$derfile"
+    fi
+fi
+
 if [ "$#" -gt 0 ]; then
     exec "$@"
 fi

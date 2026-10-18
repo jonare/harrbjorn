@@ -3,7 +3,7 @@
 #
 # Usage:
 #   harrbjorn code [-w <workdir>] [-a host[:port]]... [-H port]...
-#                  [-f extra-allowlist] [--rebuild] [--] [<cmd> [args...]]
+#                  [-f extra-allowlist] [-p host:port] [--rebuild] [--] [<cmd> [args...]]
 #   (equivalent to ./run-code.sh; <workdir> defaults to the current
 #   directory, and `--` is optional — the first non-flag argument
 #   starts the command. With no command, an interactive bash opens in
@@ -15,6 +15,12 @@
 #   Nettverk: åpen utgang som standard (SBX_OPEN_NETWORK=1) — proxyen logger
 #   all trafikk, men håndhever ikke allowlisten. SBX_OPEN_NETWORK=0 (env/.env)
 #   gir klassisk allowlist-adgang (allowlist.code.default + -a/-f).
+#
+#   Ekstern proxy: -p 127.0.0.1:4321 bruker en ekstern forward-proxy
+#   (f.eks. Burp Suite) som utgang — harrbjorns proxy startes ikke, og
+#   allowlisten gjelder ikke (firewall-logikken er proxyens jobb).
+#   Fail-closed: svarer ingenting på porten, avsluttes sesjonen (ingen
+#   fallback). Burp-CA auto-installas dersom proxyen detekteres.
 #
 #   Host-tjenester (testinstanser på hosten): -H 8080 -H 9443
 #   tillater eksplisitt, port for port, nåing av hosten via
@@ -32,6 +38,7 @@
 #   harrbjorn code -w ~/proj claude         # annen workdir enn cwd
 #   harrbjorn code pi                       # interaktiv pi i cwd (samme modellkonfig som claude)
 #   harrbjorn code pi -p "Fix the failing tests"
+#   harrbjorn code -p 127.0.0.1:4321 claude -p "Test via Burp"  # ekstern proxy
 #
 # Isolasjonslag (rootless podman, ingen sudo; hvert holder selv hvis ett feiler):
 #   1. sandbox kjører kun på sesjonens internal-nett (ingen direkte utgang)
@@ -41,7 +48,7 @@
 #   5. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
 
 set -euo pipefail
-sbx_usage() { sed -n '2,41p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,48p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code

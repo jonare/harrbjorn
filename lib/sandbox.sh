@@ -13,8 +13,10 @@
 # og avslutter med gitt exit-kode.
 #
 # Runtime: rootless Podman, --userns=keep-id, per-sesjon nett (podman network
-# --internal) med per-sesjon proxy som eneste utgang. Ingen sudo: hosten
-# berøres aldri (nattverks-isolasjon kjører i nettverket, ikke i iptables).
+# --internal) med per-sesjon proxy som eneste utgang. Med -p har sesjon-nettet
+# egress i stedet, og den eksterne proxyen er firevallen (fail-closed: ingen
+# fallback hvis den ikke svarer). Ingen sudo: hosten berøres aldri
+# (nattverks-isolasjon kjører i nettverket, ikke i iptables).
 #
 # OCI-runtime (SBX_RUNTIME): krun (microVM via KVM, default), runsc (gVisor)
 # eller crun (eksplisitt valgt — aldri stille fallback). Wrapperen feiler
@@ -32,6 +34,10 @@ SBX_IMAGE="${SBX_IMAGE:-harrbjorn/code:latest}"
 SBX_CONTEXT="${SBX_CONTEXT:-code}"
 SBX_ALLOWLIST_DEFAULT="${SBX_ALLOWLIST_DEFAULT:-allowlist.code.default}"
 SBX_OPEN_NETWORK="${SBX_OPEN_NETWORK:-1}"
+
+# Porten harrbjorns egen proxy lytter på (container-side). Ved -p er den
+# eksterne proxyens port den som gjelder i stedet, og denne brukes ikke.
+PROXY_PORT=3128
 
 # Per-sesjon ressurser (globale slik at EXIT-trappen kan rømme dem).
 PROXY_NAME=""
@@ -284,6 +290,119 @@ with open(f"{outdir}/proxy.yaml", "w") as f:
 PY
 }
 
+# ------------------------------------------------------------ proxy
+# Start harrbjorn's own egress: merged allowlist → Smokescreen policy →
+# per-session resolv.conf → per-session proxy container → readiness probe.
+# The whole section runs only when harrbjorn's proxy is the egress; with -p
+# the external proxy is the firewall and none of this is created.
+# RESOLV_CONF / POLICY_DIR / PROXY_NAME are globals so sbx_cleanup can
+# release them (PROXY_PORT is a top-level constant).
+sbx_start_proxy() {
+  local S="$1" MODE_TAG="$2" MERGED
+
+  # --------------------------------------------------------- allowlist
+  mkdir -p "$STATE_DIR"
+  [[ -f "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" ]] \
+    || { echo "error: allowlist default '$SBX_ALLOWLIST_DEFAULT' not found" >&2; exit 1; }
+  # Per-session merged allowlist: concurrent sessions (code + pentest) must
+  # not share one file — each proxy loads whatever the other session wrote
+  # last, and -a targets would be lost.
+  MERGED="$STATE_DIR/allowlist-$S.txt"
+  {
+    echo "# merged at $(date -u +%Y-%m-%dT%H:%M:%SZ) by harrbjorn $SBX_USECASE"
+    grep -vE '^\s*(#|$)' "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" || true
+    for h in ${EXTRA_HOSTS[@]+"${EXTRA_HOSTS[@]}"}; do echo "$h"; done
+    if [[ -n "$EXTRA_ALLOWLIST" ]]; then
+      grep -vE '^\s*(#|$)' "$EXTRA_ALLOWLIST" || true
+    fi
+  } | sort -u > "$MERGED"
+
+  # -------------------------------------------------------- proxy policy
+  # Smokescreen config (proxy.yaml + acl.yaml), generated from the merged
+  # allowlist + egress mode + trusted host; mounted at /config in the proxy.
+  # The allowlist keeps its user-facing format; only the generated policy
+  # is new. Generation failure aborts before any session resource leaks
+  # (the EXIT trap cleans up what exists so far).
+  POLICY_DIR="$STATE_DIR/proxy-$S"
+  mkdir -p "$POLICY_DIR"
+  sbx_write_proxy_policy "$POLICY_DIR" || exit 1
+
+  # ------------------------------------------------------------- proxy
+  # Per-session proxy: one hop on pasta's default network (real egress +
+  # host.containers.internal), one hop on the session's internal network
+  # (reaches the sandbox).
+  #
+  # resolv.conf is bind-mounted, not left to the networks: a multi-homed
+  # container's resolv.conf comes from the internal net, whose nameserver
+  # (aardvark) answers NXDOMAIN for every external name — and glibc treats
+  # the *first* nameserver's answer as final, no fallback. The host's real
+  # upstream servers are the proxy's only nameservers. (No search domains:
+  # the proxy only looks up fully qualified names; host.containers.internal
+  # comes from /etc/hosts, not DNS.)
+  local DNS
+  DNS="$(sbx_uplink_dns)" || true
+  if [[ -z "$DNS" ]]; then
+    echo "error: could not determine the host's upstream DNS; the proxy would be blind to external names." >&2
+    exit 1
+  fi
+  RESOLV_CONF="$STATE_DIR/resolv-$S.conf"
+  {
+    echo "# per-session proxy nameservers (written by harrbjorn $SBX_USECASE)"
+    while IFS= read -r ns; do echo "nameserver $ns"; done <<< "$DNS"
+  } > "$RESOLV_CONF"
+  echo ">> proxy $PROXY_NAME: starting (net $NET_NAME${MODE_TAG}, dns: $(printf '%s' "$DNS" | tr '\n' ' '))"
+  $PODMAN run -d --name "$PROXY_NAME" \
+    "${RUNTIME_ARGS[@]}" \
+    --userns=keep-id:uid=1000,gid=1000 \
+    --network podman --network "$NET_NAME" \
+    -v "$RESOLV_CONF:/etc/resolv.conf:ro,z" \
+    -v "$POLICY_DIR:/config:ro,z" \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --user 65534:65534 \
+    --memory 256m --pids-limit 128 --ulimit nofile=65536:65536 \
+    harrbjorn/sbx-proxy:latest \
+    --config-file /config/proxy.yaml >/dev/null
+  # Wait until the proxy is ready.
+  #
+  # Probe = a throwaway container on the session's internal net that does a
+  # raw TCP connect to the proxy's IP — the exact path a sandboxed request
+  # takes, so "answered" means "will serve". The alternatives are all
+  # ruled out:
+  #   * `podman exec` in the proxy: krun (microVM) has no exec.
+  #   * polling the proxy's startup log line: krun's log channel is flaky —
+  #     the line can stay invisible for minutes while the proxy is fully
+  #     up and serving, so it cannot arbitrate.
+  #   * a host-side connect: the host cannot reach a krun container on any
+  #     network (pasta only bridges container→host, e.g. for
+  #     host.containers.internal).
+  # The helper reuses $SBX_IMAGE (already built above) — no extra image to
+  # pull — with the entrypoint overridden, so sbx-init.sh never runs. It
+  # polls for up to 90s and exits 0 on the first answered connect; the
+  # proxy normally answers in ~1s, so the common case costs one brief
+  # container start. A config/ACL that fails Validate never binds the
+  # socket, so the deadline fires and the error path below does the rest.
+  local PROXY_IP
+  PROXY_IP="$($PODMAN inspect \
+    -f "{{(index .NetworkSettings.Networks \"$NET_NAME\").IPAddress}}" "$PROXY_NAME")"
+  if [[ -n "$PROXY_IP" ]] && $PODMAN run --rm --network "$NET_NAME" \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --entrypoint bash \
+    "$SBX_IMAGE" \
+    -c 'for _ in $(seq 1 180); do (exec 3<>/dev/tcp/'"$PROXY_IP"'/3128) 2>/dev/null && exit 0; sleep 0.5; done; echo "proxy never answered on '"$PROXY_IP"':3128"; exit 1'; then
+    echo ">> proxy is up"
+  else
+    {
+      echo "error: proxy failed to start (no answered connect to $PROXY_IP:3128 within 90s)." >&2
+      echo "--- last proxy log lines:" >&2
+      $PODMAN logs "$PROXY_NAME" 2>&1 | tail -5 >&2 || true
+      echo "  (rerun to reproduce; the proxy container is removed on exit)" >&2
+    }
+    exit 1
+  fi
+}
+
 # ----------------------------------------------------------------- runtime
 # SBX_RUNTIME (env/.env) selects the OCI runtime for BOTH session containers
 # (sandbox and proxy): krun (default — microVM via KVM, own kernel), runsc
@@ -331,9 +450,9 @@ sbx_check_runtime() {
 }
 
 sbx_main() {
-  local WORKDIR="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
+  local WORKDIR="" EXT_PROXY="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
   local HOST_PORTS=()
-  local REBUILD=0 T CONFIG_ENV=() MERGED
+  local REBUILD=0 T CONFIG_ENV=() PROXY_ENV=()
   local S SBX_NAME PROXY_TRUSTED="" RUNTIME_ARGS=()
 
   while [[ $# -gt 0 ]]; do
@@ -346,6 +465,8 @@ sbx_main() {
           HOST_PORTS+=("$2"); shift 2 ;;
       -f) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
           EXTRA_ALLOWLIST="$2"; shift 2 ;;
+      -p) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
+          EXT_PROXY="$2"; shift 2 ;;
       --rebuild) REBUILD=1; shift ;;
       -h|--help) sbx_usage 0 ;;
       --) shift; break ;;
@@ -366,6 +487,48 @@ sbx_main() {
   WORKDIR="${WORKDIR:-$PWD}"
   [[ -d "$WORKDIR" ]] || { echo "error: workdir $WORKDIR does not exist" >&2; exit 1; }
   local WORKDIR_ABS="$(cd "$WORKDIR" && pwd)"
+
+  # -------------------------------------------------------- external proxy
+  # -p host:port: an external forward proxy (e.g. Burp Suite) takes over
+  # egress: harrbjorn's Smokescreen proxy is NOT started and its allowlist
+  # is NOT enforced — the firewall logic is the external proxy's job.
+  # Consequences, both deliberate:
+  #   * the session net gets egress (no --internal) so the sandbox can
+  #     reach the proxy directly — a container on an internal net cannot
+  #     even reach the host's address;
+  #   * fail-closed: if nothing answers on the port, the session aborts.
+  #     There is no fallback — not to the per-session proxy, not to an
+  #     open network. The check runs from the host, which can reach every
+  #     address the sandbox can (pasta only bridges container→host).
+  local ext_host ext_port tcp_target
+  if [[ -n "$EXT_PROXY" ]]; then
+    ext_host="${EXT_PROXY%:*}"; ext_port="${EXT_PROXY##*:}"
+    if [[ -n "$ext_host" && "$EXT_PROXY" == *":"* && "$ext_port" =~ ^[0-9]+$ ]] \
+       && (( ext_port >= 1 && ext_port <= 65535 )); then
+      :
+    else
+      echo "error: -p: bad proxy '$EXT_PROXY' (need host:port, port 1-65535)" >&2
+      sbx_usage 1
+    fi
+    if (( ${#EXTRA_HOSTS[@]} )) || [[ -n "$EXTRA_ALLOWLIST" ]] || (( ${#HOST_PORTS[@]} )); then
+      echo "warn: -a/-f/-H have no effect with -p (harrbjorn's proxy is not started; the external proxy is the firewall)." >&2
+    fi
+    # Fail-closed: probe from the host with the address as given. The probe
+    # must run BEFORE the loopback rewrite — host.containers.internal only
+    # resolves inside the container net, never on the host.
+    tcp_target="$ext_host"
+    case "$ext_host" in *:*) tcp_target="[$ext_host]" ;; esac
+    if ! timeout 5 bash -c "exec 3<>/dev/tcp/$tcp_target/$ext_port" 2>/dev/null; then
+      echo "error: -p: no forward proxy answering at $EXT_PROXY (fail-closed: no fallback, session not started)." >&2
+      exit 1
+    fi
+    # Host loopback is reached from the container via host.containers.internal.
+    case "$ext_host" in
+      localhost|127.0.0.1|::1) ext_host="host.containers.internal" ;;
+    esac
+    EXT_PROXY_RW="http://$ext_host:$ext_port"
+    echo ">> external proxy: $EXT_PROXY (container: $EXT_PROXY_RW; harrbjorn's proxy is not started)"
+  fi
 
   # ---------------------------------------------------------------- .env
   # Wrapper-preset (f.eks. SBX_PIDS fra run-pentest.sh) er satt før source;
@@ -390,6 +553,7 @@ sbx_main() {
   local SBX_RUNTIME="${SBX_RUNTIME:-krun}"
   local MODE_TAG=""
   [[ "$SBX_OPEN_NETWORK" == "1" ]] && MODE_TAG=", open network"
+  [[ -n "$EXT_PROXY" ]] && MODE_TAG=", external proxy"
 
   # ----------------------------------------------- model config (injection)
   # The sandbox reuses the host's Claude Code model setup (SBX_CLAUDE_CONFIG,
@@ -485,7 +649,6 @@ sbx_main() {
   # collide, and sbx_reap_orphans only ever touches what it created.
   S="${SBX_USECASE}-$(date +%s)-$$"
   NET_NAME="sbx-$S-int"
-  PROXY_NAME="sbx-$S-proxy"
   SBX_NAME="sbx-$S"
   SESSION_LOG="$STATE_DIR/logs/$S.jsonl"
   trap sbx_cleanup EXIT
@@ -505,112 +668,31 @@ sbx_main() {
     build_image harrbjorn/code:latest code
   fi
   build_image "$SBX_IMAGE" "$SBX_CONTEXT"
-  build_image harrbjorn/sbx-proxy:latest proxy
+  # The Smokescreen image is only needed when harrbjorn runs its own proxy;
+  # with -p the external proxy is the egress and the image is never pulled.
+  if [[ -z "$EXT_PROXY" ]]; then
+    build_image harrbjorn/sbx-proxy:latest proxy
+  fi
 
   # ----------------------------------------------------------- network
-  $PODMAN network create --internal "$NET_NAME" >/dev/null
-
-  # --------------------------------------------------------- allowlist
-  mkdir -p "$STATE_DIR"
-  [[ -f "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" ]] \
-    || { echo "error: allowlist default '$SBX_ALLOWLIST_DEFAULT' not found" >&2; exit 1; }
-  # Per-session merged allowlist: concurrent sessions (code + pentest) must
-  # not share one file — each proxy loads whatever the other session wrote
-  # last, and -a targets would be lost.
-  MERGED="$STATE_DIR/allowlist-$S.txt"
-  {
-    echo "# merged at $(date -u +%Y-%m-%dT%H:%M:%SZ) by harrbjorn $SBX_USECASE"
-    grep -vE '^\s*(#|$)' "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" || true
-    for h in ${EXTRA_HOSTS[@]+"${EXTRA_HOSTS[@]}"}; do echo "$h"; done
-    if [[ -n "$EXTRA_ALLOWLIST" ]]; then
-      grep -vE '^\s*(#|$)' "$EXTRA_ALLOWLIST" || true
-    fi
-  } | sort -u > "$MERGED"
-
-  # -------------------------------------------------------- proxy policy
-  # Smokescreen config (proxy.yaml + acl.yaml), generated from the merged
-  # allowlist + egress mode + trusted host; mounted at /config in the proxy.
-  # The allowlist keeps its user-facing format; only the generated policy
-  # is new. Generation failure aborts before any session resource leaks
-  # (the EXIT trap cleans up what exists so far).
-  local PROXY_PORT=3128
-  POLICY_DIR="$STATE_DIR/proxy-$S"
-  mkdir -p "$POLICY_DIR"
-  sbx_write_proxy_policy "$POLICY_DIR" || exit 1
-
-  # ------------------------------------------------------------- proxy
-  # Per-session proxy: one hop on pasta's default network (real egress +
-  # host.containers.internal), one hop on the session's internal network
-  # (reaches the sandbox).
-  #
-  # resolv.conf is bind-mounted, not left to the networks: a multi-homed
-  # container's resolv.conf comes from the internal net, whose nameserver
-  # (aardvark) answers NXDOMAIN for every external name — and glibc treats
-  # the *first* nameserver's answer as final, no fallback. The host's real
-  # upstream servers are the proxy's only nameservers. (No search domains:
-  # the proxy only looks up fully qualified names; host.containers.internal
-  # comes from /etc/hosts, not DNS.)
-  local DNS
-  DNS="$(sbx_uplink_dns)" || true
-  if [[ -z "$DNS" ]]; then
-    echo "error: could not determine the host's upstream DNS; the proxy would be blind to external names." >&2
-    exit 1
-  fi
-  RESOLV_CONF="$STATE_DIR/resolv-$S.conf"
-  {
-    echo "# per-session proxy nameservers (written by harrbjorn $SBX_USECASE)"
-    while IFS= read -r ns; do echo "nameserver $ns"; done <<< "$DNS"
-  } > "$RESOLV_CONF"
-  echo ">> proxy $PROXY_NAME: starting (net $NET_NAME${MODE_TAG}, dns: $(printf '%s' "$DNS" | tr '\n' ' '))"
-  $PODMAN run -d --name "$PROXY_NAME" \
-    "${RUNTIME_ARGS[@]}" \
-    --userns=keep-id:uid=1000,gid=1000 \
-    --network podman --network "$NET_NAME" \
-    -v "$RESOLV_CONF:/etc/resolv.conf:ro,z" \
-    -v "$POLICY_DIR:/config:ro,z" \
-    --read-only --tmpfs /tmp \
-    --cap-drop ALL --security-opt no-new-privileges \
-    --user 65534:65534 \
-    --memory 256m --pids-limit 128 --ulimit nofile=65536:65536 \
-    harrbjorn/sbx-proxy:latest \
-    --config-file /config/proxy.yaml >/dev/null
-  # Wait until the proxy is ready.
-  #
-  # Probe = a throwaway container on the session's internal net that does a
-  # raw TCP connect to the proxy's IP — the exact path a sandboxed request
-  # takes, so "answered" means "will serve". The alternatives are all
-  # ruled out:
-  #   * `podman exec` in the proxy: krun (microVM) has no exec.
-  #   * polling the proxy's startup log line: krun's log channel is flaky —
-  #     the line can stay invisible for minutes while the proxy is fully
-  #     up and serving, so it cannot arbitrate.
-  #   * a host-side connect: the host cannot reach a krun container on any
-  #     network (pasta only bridges container→host, e.g. for
-  #     host.containers.internal).
-  # The helper reuses $SBX_IMAGE (already built above) — no extra image to
-  # pull — with the entrypoint overridden, so sbx-init.sh never runs. It
-  # polls for up to 90s and exits 0 on the first answered connect; the
-  # proxy normally answers in ~1s, so the common case costs one brief
-  # container start. A config/ACL that fails Validate never binds the
-  # socket, so the deadline fires and the error path below does the rest.
-  local PROXY_IP
-  PROXY_IP="$($PODMAN inspect \
-    -f "{{(index .NetworkSettings.Networks \"$NET_NAME\").IPAddress}}" "$PROXY_NAME")"
-  if [[ -n "$PROXY_IP" ]] && $PODMAN run --rm --network "$NET_NAME" \
-    --read-only --tmpfs /tmp \
-    --cap-drop ALL --security-opt no-new-privileges \
-    --entrypoint bash \
-    "$SBX_IMAGE" \
-    -c 'for _ in $(seq 1 180); do (exec 3<>/dev/tcp/'"$PROXY_IP"'/3128) 2>/dev/null && exit 0; sleep 0.5; done; echo "proxy never answered on '"$PROXY_IP"':3128"; exit 1'; then
-    echo ">> proxy is up"
+  if [[ -n "$EXT_PROXY" ]]; then
+    # -p: the sandbox must reach the external proxy directly, so the session
+    # net has egress — a container on an internal net cannot even reach the
+    # host's address. The "no raw egress" layer is replaced by the external
+    # proxy being the firewall (README: «Ekstern proxy»).
+    $PODMAN network create "$NET_NAME" >/dev/null
   else
-    {
-      echo "error: proxy failed to start (no answered connect to $PROXY_IP:3128 within 90s)." >&2
-      echo "--- last proxy log lines:" >&2
-      $PODMAN logs "$PROXY_NAME" 2>&1 | tail -5 >&2 || true
-      echo "  (rerun to reproduce; the proxy container is removed on exit)" >&2
-    }
-    exit 1
+    PROXY_NAME="sbx-$S-proxy"
+    $PODMAN network create --internal "$NET_NAME" >/dev/null
+  fi
+
+  # ------------------------------------------------ allowlist + proxy
+  # harrbjorn's own egress only: allowlist → policy → proxy → readiness.
+  # With -p the external proxy is the firewall and the whole section is
+  # skipped — no policy, no per-session DNS, no proxy container, no audit
+  # log (see sbx_start_proxy).
+  if [[ -z "$EXT_PROXY" ]]; then
+    sbx_start_proxy "$S" "$MODE_TAG"
   fi
 
   # --------------------------------------------- persistent agent HOME
@@ -640,6 +722,24 @@ sbx_main() {
   # path lives under .sandbox/ which is never mounted into the container, so
   # no agent run can pre-plant links along it.
 
+  # ------------------------------------------------------- proxy env (container)
+  # Where the container's traffic goes: the per-session Smokescreen by
+  # default, or the user's external proxy with -p (rewritten above, loopback
+  # → host.containers.internal). With -p we also pass SBX_EXTERNAL_PROXY so
+  # sbx-init.sh can detect a Burp proxy and install its CA from
+  # http://<proxy>/cert (the fetch bypasses the proxy env — the listener
+  # itself serves the endpoint, and going through the proxy would loop).
+  if [[ -n "$EXT_PROXY" ]]; then
+    PROXY_ENV=(-e HTTP_PROXY="$EXT_PROXY_RW" -e http_proxy="$EXT_PROXY_RW"
+               -e HTTPS_PROXY="$EXT_PROXY_RW" -e https_proxy="$EXT_PROXY_RW"
+               -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1'
+               -e SBX_EXTERNAL_PROXY="$EXT_PROXY_RW")
+  else
+    PROXY_ENV=(-e HTTP_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e http_proxy="http://$PROXY_NAME:$PROXY_PORT"
+               -e HTTPS_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e https_proxy="http://$PROXY_NAME:$PROXY_PORT"
+               -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1')
+  fi
+
   # ------------------------------------------------------------- sandbox
   # -i is always required so stdin reaches the container; -t only with a TTY.
   # tmpfs mounts need no uid=/gid=: keep-id makes container 1000 == host
@@ -655,11 +755,9 @@ sbx_main() {
     --user 1000:1000 \
     -v "$WORKDIR_ABS:/work:z" -v "$AGENT_HOME:/home/agent:z" -w /work \
     "${CONFIG_ENV[@]}" \
+    "${PROXY_ENV[@]}" \
     -e HOME=/home/agent \
     -e LANG="$SBX_LOCALE" \
-    -e HTTP_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e http_proxy="http://$PROXY_NAME:$PROXY_PORT" \
-    -e HTTPS_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e https_proxy="http://$PROXY_NAME:$PROXY_PORT" \
-    -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1' \
     -e DISABLE_TELEMETRY=1 -e DO_NOT_TRACK=1 -e DISABLE_AUTOUPDATER=1 \
     -e PI_TELEMETRY=0 -e PI_SKIP_VERSION_CHECK=1 \
     --read-only \

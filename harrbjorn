@@ -19,14 +19,15 @@
 #   harrbjorn code                               # interaktiv bash i cwd (default)
 #   harrbjorn code claude                        # interaktiv claude i cwd
 #   harrbjorn security -a 10.0.0.5:8080 claude -p "Test målet"
+#   harrbjorn code -p 127.0.0.1:4321 claude      # eksterne proxy (Burp); CA auto-installas
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-usage() { sed -n '2,21p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,22p' "$0"; exit "${1:-0}"; }
 
 # Autocomplete (bash): fullfører subkommandoene (code, security) og
-# usecase-flaggene (-w -a -H -f --rebuild). Eval-eres fra ~/.bashrc:
+# usecase-flaggene (-w -a -H -f -p --rebuild). Eval-eres fra ~/.bashrc:
 #   eval "$(harrbjorn completion)"
 completion() {
   cat <<'EOF'
@@ -38,7 +39,7 @@ _harrbjorn() {
   if (( COMP_CWORD == 1 )); then
     COMPREPLY=($(compgen -W "code security help completion" -- "$cur"))
   elif [[ "$cmd" == code || "$cmd" == security ]] && [[ "$cur" == -* ]]; then
-    COMPREPLY=($(compgen -W "-w -a -H -f --rebuild --help -- -" -- "$cur"))
+    COMPREPLY=($(compgen -W "-w -a -H -f -p --rebuild --help -- -" -- "$cur"))
   fi
   return 0
 }
