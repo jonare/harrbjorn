@@ -49,3 +49,8 @@ Testene ligger i `tests/` og kjøres som bash (ingen testrunner-rammeverk):
 
 En endring er ikke ferdig før den korrespondende testen passerer; en ny bug som
 fikses skal fange bug-en først (red) og deretter låse den (green).
+
+## Arbeidsflyt
+
+Opprett en branch og gjør arbeidet der. Merge til main skjer ikke av deg —
+brukeren avgjør når det skal merges.
