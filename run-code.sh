@@ -21,6 +21,8 @@
 #   allowlisten gjelder ikke (firewall-logikken er proxyens jobb).
 #   Fail-closed: svarer ingenting på porten, avsluttes sesjonen (ingen
 #   fallback). Burp-CA auto-installas dersom proxyen detekteres.
+#   host.containers.internal er i NO_PROXY: hosttrafikk (især
+#   modellserveren) går rett til hosten, ikke gjennom proxyen.
 #
 #   Host-tjenester (testinstanser på hosten): -H 8080 -H 9443
 #   tillater eksplisitt, port for port, nåing av hosten via
@@ -48,7 +50,7 @@
 #   5. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
 
 set -euo pipefail
-sbx_usage() { sed -n '2,48p' "$0"; exit "${1:-0}"; }
+sbx_usage() { sed -n '2,50p' "$0"; exit "${1:-0}"; }
 export SBX_USECASE=code
 export SBX_IMAGE=harrbjorn/code:latest
 export SBX_CONTEXT=code

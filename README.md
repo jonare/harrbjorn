@@ -347,6 +347,15 @@ harrbjorns egen proxy:
   eneste kontrollerte utgangen — HTTP(S)-kjente verktøy (curl, git, npm,
   agent-CLIene) går via `HTTP(S)_PROXY` til den eksterne proxyen, som
   samtidig ser og kan logger/MITM-sjekke alt.
+- **Host-trafikk bypasser proxyen** — `host.containers.internal` ligger i
+  `NO_PROXY` i `-p`-modus: den eksterne proxyen kjører selv på hosten og
+  kan ikke løse navnet, så trafikken til hosten (især modellserveren fra
+  `SBX_CLAUDE_CONFIG`, rewrite fra `localhost`) går rett mot hosten via
+  pasta-linken i stedet for gjennom proxyen. Sesjonsnettverket har reell
+  egress uansett, så dette åpner ingenting nytt; `-H` er da unødvendig
+  (og virker ikke). I normalmodus (uten `-p`) må hosttrafikken i stedet
+  gå *gjennom* Smokescreen via `PROXY_TRUSTED`, og navnet er *ikke* i
+  `NO_PROXY` der.
 - **Burp CA auto-installas** — svarer porten med et parsbart X.509-sertifikat
   på `http://<proxy>/cert` (Burp Suites selvsignerte CA), henter init-steget
   i containeren (`code/sbx-init.sh`) det (direkte, `--noproxy`), slår det

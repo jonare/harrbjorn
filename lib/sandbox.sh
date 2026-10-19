@@ -729,10 +729,19 @@ sbx_main() {
   # sbx-init.sh can detect a Burp proxy and install its CA from
   # http://<proxy>/cert (the fetch bypasses the proxy env — the listener
   # itself serves the endpoint, and going through the proxy would loop).
+  #
+  # With -p, host.containers.internal goes into NO_PROXY: the external proxy
+  # (Burp) runs on the host and cannot resolve that name, so host traffic —
+  # notably the model server rewritten above — must go straight to the host
+  # via the pasta link instead of through the proxy. The session net with -p
+  # already has real egress, so this exposes nothing new. The default branch
+  # must NOT list it there: on the --internal net the host is only reachable
+  # through the Smokescreen, which carries the model traffic under
+  # PROXY_TRUSTED.
   if [[ -n "$EXT_PROXY" ]]; then
     PROXY_ENV=(-e HTTP_PROXY="$EXT_PROXY_RW" -e http_proxy="$EXT_PROXY_RW"
                -e HTTPS_PROXY="$EXT_PROXY_RW" -e https_proxy="$EXT_PROXY_RW"
-               -e NO_PROXY='localhost,127.0.0.1,::1' -e no_proxy='localhost,127.0.0.1,::1'
+               -e NO_PROXY='localhost,127.0.0.1,::1,host.containers.internal' -e no_proxy='localhost,127.0.0.1,::1,host.containers.internal'
                -e SBX_EXTERNAL_PROXY="$EXT_PROXY_RW")
   else
     PROXY_ENV=(-e HTTP_PROXY="http://$PROXY_NAME:$PROXY_PORT" -e http_proxy="http://$PROXY_NAME:$PROXY_PORT"
