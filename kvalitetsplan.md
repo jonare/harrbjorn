@@ -27,7 +27,8 @@ oppdater **Status** nedenfor (commit det i samme eller neste commit).
 
 - Branch: `kvalitet-testdekning` (fra main @ 9ed782d).
 - Del 0: **ferdig** (commit 6496fd8 — `kvalitetsplan.md` ligg her).
-- Del 1–4: **gjenstår**. Start med Del 1.
+- Del 1: **ferdig** (commit cef5d27 — `tests/test-uplink-dns.sh`, 15 pass; grønt ved første kjør, ingen fix). Merk: U1 si fake bruker systemd si reelle JSON-form (liste av global + per-link), ikkje plans `{"link": [...]}`-form — reell form verifisert mot verten si `resolvectl`.
+- Del 2–4: **gjenstår**. Start med Del 2.
 
 ## Felles konvensjoner (alle fire filer)
 
