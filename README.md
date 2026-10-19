@@ -498,7 +498,16 @@ mkdir -p /tmp/sbx-a /tmp/sbx-b
   målene i denne arkitekturen — sikkerhetstesting er agent-/HTTP-drevet.
 - Tre bilder: `harrbjorn/code:latest`, `harrbjorn/pentest:latest` (bygges
   `FROM` code, så code bygges alltid først) og `harrbjorn/sbx-proxy:latest`.
-  Bildene bygges automatisk ved første kjør og med `--rebuild`.
+  Bildene bygges automatisk ved første kjør — men **bare hvis bildet mangler**.
+  Allerede bygd bilder bygges ikke på nytt, så endringer i kilde som bakker inn
+  i bildene (`code/sbx-init.sh`, `code/Dockerfile`, `pentest/Dockerfile`,
+  `proxy/Dockerfile`) **fungerer ikke** inntil du bygger med `--rebuild`. Et
+  stiltstående bilde er altså stale selv om kilden har endret seg.
+- Fordi `harrbjorn/pentest:latest` bygger `FROM harrbjorn/code:latest`, plukker
+  pentest endringer i code-bildet (f.eks. `code/sbx-init.sh`) opp **kun** når
+  pentest bygges på nytt *etter* code. Endrer du noe som bakker inn i begge
+  bildene, bygg **begge** på nytt (`harrbjorn code --rebuild` og
+  `harrbjorn security --rebuild`) i den rekkefølgen — code først.
 - Claude Code- og pi-versjonene låses ved bilde-build (auto-update er slått
   av); gjelder begge sandbox-bildene — bygg på nytt med `--rebuild` for
   oppdateringer. Pi-extensions følger samme lås: listen står i
