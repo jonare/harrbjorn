@@ -30,7 +30,8 @@ oppdater **Status** nedenfor (commit det i samme eller neste commit).
 - Del 1: **ferdig** (commit cef5d27 — `tests/test-uplink-dns.sh`, 15 pass; grønt ved første kjør, ingen fix). Merk: U1 si fake bruker systemd si reelle JSON-form (liste av global + per-link), ikkje plans `{"link": [...]}`-form — reell form verifisert mot verten si `resolvectl`.
 - Del 2: **ferdig** (commit 674b436 — `tests/test-check-runtime.sh`, 18 pass; grønt ved første kjør, ingen fix; R7 assertert på verten med tilgjengeleg `/dev/kvm`).
 - Del 3: **ferdig** (3a: commit 02db596 — `tests/test-sbx-main.sh` M1–M4, 43 pass; 3b: commit bb9bfe2 — M5–M8, totalt 59 pass; grønt ved første kjør for begge, ingen produksjonsfix — 3b sin éine harnes-endring: `sbx_run` unsetter `ANTHROPIC_API_KEY` for M7/M8 si hermetisitet).
-- Del 4: **gjenstår**.
+- Del 4: **ferdig** (4a: commit aec3251 — `tests/test-sbx-init.sh` P1–P8, 47 pass; 4b: commit 50d8649 — Burp CA B1–B6, totalt 73 pass; grønt ved første kjør for begge, ingen produksjonsfix — Burp-delen red-validert mot to mutasjonar i `code/sbx-init.sh`: trailing-slash-strip og PEM-fallback (B2/B6 feila, restaurert)).
+- Alle delar (Del 1–4): **ferdig** — planen er gjennomført; berre testfiler (og denne planen) er endra på branchen, som «Verifikasjon» krev.
 
 ## Felles konvensjoner (alle fire filer)
 
