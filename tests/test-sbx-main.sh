@@ -3,7 +3,7 @@
 # wrapper-flow (run-code.sh), kjørt hermetisk: testskallet source IKKE
 # sandbox.sh, alle assert mot PODMAN-stubbens arkart.
 #
-# Dekker (M1–M4; M5–M8 er WIP i påfølgjande commit):
+# Dekker (M1–M8):
 #  - M1 grunnleggende: run-linje (hardening, limits, runtime), --internal-nett,
 #    éi proxy-run med fanget proxy.yaml/acl.yaml (open-modus: tillitshost-port
 #    i proxy.yaml, IKKE i acl.yaml), agent-home 700, loopback-rewrite av
@@ -12,6 +12,11 @@
 #    HTTP_PROXY/SBX_EXTERNAL_PROXY mot host.containers.internal
 #  - M3 -p fail-closed: ingenting svarar på porten → exit 1, ingen nettverk
 #  - M4 -p ugyldig: «localhost» (ingen port) og «h:99999» → exit 1
+#  - M5 -H: duplisert port → nøyaktig éi tillitshost-post i proxy.yaml (dedup);
+#    «-H abc» → exit 1, ingen run-linje
+#  - M6 .env-preferanse: SBX_MEMORY/SBX_PIDS fra .env vinner over default
+#  - M7 ingen modellkonfig + nøkkelen i .env: advarsel + -e ANTHROPIC_API_KEY
+#  - M8 ingen modellkonfig, ingen nøkkelen → exit 1
 #
 # Krevd: bash, python3 (PyYAML for fanget YAML, loopback-lyttar i M2/M3).
 # Ingen podman (fake PODMAN-stubb), ingen ekstern nettverk (berre 127.0.0.1).
@@ -116,7 +121,9 @@ check_rc() { # label expected actual
 sbx_run() {
   local tag="$1"; shift
   : > "$T/log-$tag"
-  env -u SBX_MEMORY -u SBX_CPUS -u SBX_PIDS -u SBX_LOCALE \
+  # -u ANTHROPIC_API_KEY: M7/M8 må isolere nøkkelen til .env — ein nøkkel i
+  # vertens miljø ville skjule M8 si feil og forfalske M7 si kilde.
+  env -u SBX_MEMORY -u SBX_CPUS -u SBX_PIDS -u SBX_LOCALE -u ANTHROPIC_API_KEY \
     HOME="$T/home" \
     SBX_CLAUDE_CONFIG="$T/claude.sh" \
     SBX_RUNTIME=crun \
@@ -228,6 +235,50 @@ check_absent "M4: 'localhost' — ingen network create" "$T/log-m4a" "^PODMAN ne
 sbx_run m4b -p h:99999 -w "$T/work-m1"
 check_rc    "M4: 'h:99999' (port > 65535) → exit 1" 1 "$RC"
 check       "M4: 'h:99999' feilmelding" "$T/err-m4b.log" "error: -p: bad proxy 'h:99999'"
+
+# ---------------------------------------------------------- M5 -H host-portar
+# -H port → tillitt upstream på host.containers.internal (proxy.yaml si
+# allow_addresses). Duplisert port må bli nøyaktig éi post — dedup i
+# PROXY_TRUSTED og i policy-generatoren.
+sbx_run m5 -H 8080 -H 8080 -w "$T/work-m1"
+check_rc    "M5: exit 0" 0 "$RC"
+P="$T/cap-m5/proxy.yaml"
+check_once  "M5: dedup — nøyaktig éi 169.254.1.2:8080" "$P" "169\.254\.1\.2:8080"
+check_once  "M5: modellporten 8787 finst òg"            "$P" "169\.254\.1\.2:8787"
+sbx_run m5b -H abc -w "$T/work-m1"
+check_rc     "M5: '-H abc' → exit 1" 1 "$RC"
+check        "M5: '-H abc' feilmelding" "$T/err-m5b.log" "error: -H: bad port 'abc'"
+check_absent "M5: '-H abc' — ingen run-linje" "$T/log-m5b" "^PODMAN run"
+
+# ---------------------------------------------------------- M6 .env-preferanse
+# .env blir sourcea i sbx_main (set -a) og vinn over defaulten:
+# --memory 4g/--pids-limit 1024 → verdiane i .env.
+printf 'SBX_MEMORY=7g\nSBX_PIDS=42\n' > "$T/repo/.env"
+sbx_run m6 -w "$T/work-m1"
+check_rc "M6: exit 0" 0 "$RC"
+LOG="$T/log-m6"
+check  "M6: --memory 7g (frå .env)"       "$LOG" "\-\-memory 7g"
+check  "M6: --pids-limit 42 (frå .env)"   "$LOG" "\-\-pids-limit 42"
+
+# ------------------------------------------- M7 ingen modellkonfig + nøkkelen
+# SBX_CLAUDE_CONFIG peiker på finast fil (sletta $T/claude.sh) → advarsel, og
+# ANTHROPIC_API_KEY kjem frå .env (sourcea med set -a — vinn over env).
+rm -f "$T/claude.sh"
+printf 'ANTHROPIC_API_KEY=test-key\n' > "$T/repo/.env"
+sbx_run m7 -w "$T/work-m1"
+check_rc "M7: exit 0" 0 "$RC"
+check  "M7: -e ANTHROPIC_API_KEY (frå .env)" "$T/log-m7" "\-e ANTHROPIC_API_KEY=test-key"
+check  "M7: advarsel om manglande modellkonfig" "$T/err-m7.log" "warn: no model config at"
+
+# ------------------------------------- M8 ingen modellkonfig, ingen nøkkelen
+# Ingen konfig + usetta ANTHROPIC_API_KEY (sletta .env, -u i harneset) →
+# hard feil før noko sesjonsressurs oppretast.
+rm -f "$T/repo/.env"
+sbx_run m8 -w "$T/work-m1"
+check_rc     "M8: exit 1" 1 "$RC"
+check        "M8: feilmelding" "$T/err-m8.log" "set ANTHROPIC_API_KEY in .env, or provide a model config"
+check_absent "M8: ingen network create" "$T/log-m8" "^PODMAN network create"
+check_absent "M8: ingen run-linje"      "$T/log-m8" "^PODMAN run"
 
 echo
 echo "$pass passed, $fail failed"
