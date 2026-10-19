@@ -20,7 +20,14 @@ Mål: fire nye self-contained testfiler under `tests/` som låser inn oppførsel
 | 3 | `tests/test-sbx-main.sh` |
 | 4 | `tests/test-sbx-init.sh` |
 
-Hver del: skriv test → kjør → grønt (eller red → minimal fix → grønt) → commit.
+Hver del: skriv test → kjør → grønt (eller red → minimal fix → grønt) → commit →
+oppdater **Status** nedenfor (commit det i samme eller neste commit).
+
+## Status
+
+- Branch: `kvalitet-testdekning` (fra main @ 9ed782d).
+- Del 0: **ferdig** (commit 6496fd8 — `kvalitetsplan.md` ligg her).
+- Del 1–4: **gjenstår**. Start med Del 1.
 
 ## Felles konvensjoner (alle fire filer)
 
@@ -102,8 +109,16 @@ Kjøre `sh $T/sbx-init-test.sh` direkte på vertsen med `HOME=$T/home` (scriptet
 
 1. Opprett branch `kvalitet-testdekning` (hovudsessjon).
 2. **Del 0** (hovudsessjon, kjappt): skriv `kvalitetsplan.md` (innhald = denne planen) i repo-rotten; commit.
-3. Del 1–4 i rekkjefølgje, kvar som eitt subagent-løp: skriv testfila → `bash tests/<fil>.sh` → grønt (lås inn) eller red → avdekt bug → minimalt produksjonsfix → grønt → commit (med `Co-Authored-By`-linja). Subagenten rapporterer kort: testnavn, grønt/red-avslutning, evt. produksjonsfix.
-4. Hovudsessjon verifiserer kvar del før neste startar.
+3. Del 1–4 i rekkjefølgje, kvar som eitt subagent-løp: skriv testfila → `bash tests/<fil>.sh` → grønt (lås inn) eller red → avdekt bug → minimalt produksjonsfix → grønt → commit (med `Co-Authored-By`-linja) → oppdater **Status**. Subagenten rapporterer kort: testnavn, grønt/red-avslutning, evt. produksjonsfix, commit-hash.
+4. Hovudsessjon verifiserer kvar del før neste startar (`bash tests/<fil>.sh` + `git status`/`git log --oneline -1`).
+
+**Subagent-prompt per del** (mønster — kort og selvstendig, subagenten leser detaljane sjølv):
+
+> Du jobbar i `/home/jonare/git/harrbjorn` på branch `kvalitet-testdekning` (ikkje other branchar, ikkje merge til main).
+> Les `kvalitetsplan.md` — avsnitta «Felles konvensjoner» og «Del N: …» (N = denne delen) — og `tests/test-proxy-policy.sh` som stilreferanse. Les deretter den funksjonen som skal testast i kjeldefila (`lib/sandbox.sh` / `code/sbx-init.sh`; linjetalla i planen er ankars, ikkje absolutte).
+> Skriv `tests/<fil>.sh` som dekkjer alle scenariene i delens avsnitt. Red-green: test først; oppførselen finst allereie, så grønt ved første kjør låser den inn. En red-test avdekkar ein bug → minimalt fix i produksjonskoden, grønt, og fix-en dokumenterast i commit-meddelandet. Testen må vere self-contained (bash + python3, ingen podman, ingen ekstern nettverk — berre 127.0.0.1).
+> Kjøre til `fail=0`, commit på branchen med `Co-Authored-By: Claude Code <noreply@anthropic.com>` (slutlinja). Oppdater Status-linja i `kvalitetsplan.md` med commit-hash og commit det òg.
+> Rapport: testfil, pass/tal, grønt eller red→fix→grønt, commit-hash.
 5. Berre testfiler (og evt. minimal fixes) — ingen endring av kode som bakkar inn i bildene, difor ingen `--rebuild`.
 
 ## Verifikasjon
