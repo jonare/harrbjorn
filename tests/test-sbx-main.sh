@@ -54,19 +54,67 @@ run_main true
 assert_match "agent-HOME: flat agent-HOME montert (én per økt under workdir-nøkkelen)" \
   "-v $HR/.sandbox/agent-home/code/proj-[0-9a-f]{16}/code-[0-9]+-[0-9]+:/home/agent:z" "$(sandbox_run)"
 
-# ------------------------------------------------- .git read-only
+# ------------------------------------------------- --work (workdir-modus)
+# Workdir er en capability: overlay er default (workdir urørt, endringer
+# som patch), ro og none gir en skrivbar /out per økt i stedet, rw er
+# skrivbar med .git read-only, og rw+git slår av .git-sperren (advarsel).
+OUTD="$HR/\.sandbox/out/code-[0-9]+-[0-9]+"
 run_main true
-assert_no_match "workdir: uten .git ingen .git-mount"   '/work/\.git' "$(sandbox_run)"
+SR="$(sandbox_run)"
+assert_match    "work: overlay er default"          "-v $HH/proj:/work:O,upperdir=" "$SR"
+assert_no_match "work: default ingen rw-bind"       ':/work:z' "$SR"
+assert_no_match "work: default ingen /out"          ':/out:' "$SR"
+
+run_main --work rw true
+assert_eq       "work rw: exit 0"                   0 "$MAIN_RC"
+assert_match    "work rw: workdir rw"               "-v $HH/proj:/work:z " "$(sandbox_run)"
+assert_no_match "work rw: uten .git ingen .git-mount" '/work/\.git' "$(sandbox_run)"
+assert_no_match "work rw: ingen /out"               ':/out:' "$(sandbox_run)"
 
 mkdir -p "$HH/proj/.git"
-run_main true
-assert_match "workdir: .git montert read-only"          "-v $HH/proj/\.git:/work/\.git:ro " "$(sandbox_run)"
-
-run_main --git-rw true
-assert_eq    "workdir: --git-rw: exit 0"                0 "$MAIN_RC"
-assert_no_match "workdir: --git-rw: ingen ro-mount"     '/work/\.git:ro' "$(sandbox_run)"
-assert_match "workdir: --git-rw advarer"                'warn: --git-rw' "$MAIN_ERR"
+run_main --work rw true
+assert_match    "work rw: .git montert read-only"   "-v $HH/proj/\.git:/work/\.git:ro " "$(sandbox_run)"
+run_main --work rw+git true
+assert_eq       "work rw+git: exit 0"               0 "$MAIN_RC"
+assert_match    "work rw+git: workdir rw"           "-v $HH/proj:/work:z " "$(sandbox_run)"
+assert_no_match "work rw+git: ingen ro-mount"       '/work/\.git:ro' "$(sandbox_run)"
+assert_match    "work rw+git: advarer"              'warn: --work rw\+git' "$MAIN_ERR"
+run_main --work ro true
+assert_no_match "work ro: ingen egen .git-mount"    '/work/\.git' "$(sandbox_run)"
 rmdir "$HH/proj/.git"
+
+rm -rf "$HR/.sandbox/out"
+run_main --work ro true
+SR="$(sandbox_run)"
+assert_eq       "work ro: exit 0"                   0 "$MAIN_RC"
+assert_match    "work ro: workdir read-only"        "-v $HH/proj:/work:ro,z " "$SR"
+assert_match    "work ro: skrivbar /out per økt"    "-v $OUTD:/out:z " "$SR"
+assert_match    "work ro: tom /out meldes"          'out: nothing written to /out' "$MAIN_ERR"
+if compgen -G "$HR/.sandbox/out/code-*" >/dev/null; then bad "work ro: tom /out fjernes" "finnes"; else ok "work ro: tom /out fjernes"; fi
+
+FAKE_PODMAN_OUT_FILE=result.txt run_main --work none true
+SR="$(sandbox_run)"
+assert_eq       "work none: exit 0"                 0 "$MAIN_RC"
+assert_no_match "work none: workdir ikke montert"   ':/work' "$SR"
+assert_match    "work none: arbeidskatalog /work"   ' -w /work ' "$SR"
+assert_match    "work none: skrivbar /out per økt"  "-v $OUTD:/out:z " "$SR"
+assert_match    "work none: /out vises etterpå"     "out: .*$OUTD" "$MAIN_ERR"
+assert_match    "work none: innholdet listes"       'result\.txt' "$MAIN_ERR"
+if compgen -G "$HR/.sandbox/out/code-*/result.txt" >/dev/null; then ok "work none: /out beholdes"; else bad "work none: /out beholdes" "borte"; fi
+assert_match    "work none: workdir er sesjonsnøkkelen" "-v $HR/\.sandbox/agent-home/code/proj-[0-9a-f]{16}/" "$SR"
+rm -rf "$HR/.sandbox/out"
+
+run_main --work bogus true
+assert_ne       "work: ukjent modus avvises"        0 "$MAIN_RC"
+assert_match    "work: melding om modus"            "--work.*bogus" "$MAIN_ERR"
+if plog_has "network create"; then bad "work: ukjent modus: ingenting opprettet" "nett laget"; else ok "work: ukjent modus: ingenting opprettet"; fi
+run_main --work
+assert_ne       "work: uten argument avvises"       0 "$MAIN_RC"
+for f in --overlay --git-rw; do
+  run_main "$f" true
+  assert_ne     "work: $f finnes ikke lenger"       0 "$MAIN_RC"
+  assert_match  "work: $f er ukjent"                "unknown option: $f" "$MAIN_ERR"
+done
 
 # ------------------------------------------- -p beholder --internal
 # Med ekstern proxy (Burp) forblir sesjonsnettet --internal: en relay
@@ -270,14 +318,15 @@ assert_eq       "økter: SBX_KEEP_SESSIONS beholder de nyeste" 2 "$(find "$HBASE
 assert_match    "økter: nyeste beholdt"               "$(basename "$(home_of)")" "$(ls "$HBASE"/proj-*)"
 rm -rf "$HBASE"
 
-# ------------------------------------------------- --overlay (opt-in)
+# ------------------------------------------------- overlay (default)
 # /work er en overlay: workdir på hosten røres ikke under økten, og agenten
 # kan skrive .git (i overlayen). Etterpå lager en nettløs hjelpecontainer
 # en patch (lib/overlay-diff.sh); hosten viser sammendrag og apply-kommando.
 OVL="$HR/\.sandbox/overlay/code-[0-9]+-[0-9]+"
 helper_run() { grep -E '^run --rm .*:/lower:O ' "$PLOG" | tail -1; }
+rm -rf "$HR/.sandbox/overlay"
 mkdir -p "$HH/proj/.git"
-run_main --overlay true
+FAKE_PODMAN_PATCH=none run_main true
 SR="$(sandbox_run)"
 assert_match    "overlay: /work som overlay"       "-v $HH/proj:/work:O,upperdir=$OVL/up,workdir=$OVL/wk " "$SR"
 assert_no_match "overlay: ingen rw-bind av workdir" ':/work:z' "$SR"
@@ -287,7 +336,7 @@ assert_match    "overlay: hjelper nettløs, samme runtime" '--runtime crun --net
 assert_match    "overlay: hjelper ser lower og merged" "-v $HH/proj:/lower:O -v $HH/proj:/merged:O,upperdir=$OVL/up,workdir=$OVL/wk " "$H"
 assert_match    "overlay: hjelper herdet"          ' --read-only .*--cap-drop ALL --security-opt no-new-privileges ' "$H"
 assert_match    "overlay: hjelper kjører overlay-diff" ' --entrypoint bash harrbjorn/code:latest -c ' "$H"
-# Fake-podman lager ingen patch: feilmelding, endringene beholdes.
+# FAKE_PODMAN_PATCH=none: ingen patch — feilmelding, endringene beholdes.
 assert_ne       "overlay: uten patch: exit ≠ 0"    0 "$MAIN_RC"
 assert_match    "overlay: uten patch: feil med upperdir" "overlay: could not build the patch.*$OVL/up" "$MAIN_ERR"
 if compgen -G "$HR/.sandbox/overlay/code-*/up" >/dev/null; then ok "overlay: upperdir beholdt ved feil"; else bad "overlay: upperdir beholdt ved feil" "borte"; fi
@@ -295,7 +344,7 @@ rm -rf "$HR/.sandbox/overlay"
 
 mkdir -p "$T_TMP/pl" "$T_TMP/pm"; echo x > "$T_TMP/pm/.envrc"
 bash "$T_REPO/lib/overlay-diff.sh" "$T_TMP/pl" "$T_TMP/pm" "$T_TMP/fake.patch"
-FAKE_PODMAN_PATCH="$T_TMP/fake.patch" run_main --overlay true
+FAKE_PODMAN_PATCH="$T_TMP/fake.patch" run_main true
 assert_eq       "overlay: exit 0"                  0 "$MAIN_RC"
 assert_match    "overlay: rapport"                 '>> overlay: the workdir was not touched' "$MAIN_ERR"
 assert_match    "overlay: sensitiv fil flagget"    '! \.envrc' "$MAIN_ERR"
@@ -305,16 +354,14 @@ if grep -qE "^unshare rm -rf $OVL$" "$PLOG"; then ok "overlay: upperdir ryddes m
 rm -rf "$HR/.sandbox/overlay"
 
 : > "$T_TMP/empty.patch"
-FAKE_PODMAN_PATCH="$T_TMP/empty.patch" run_main --overlay true
+FAKE_PODMAN_PATCH="$T_TMP/empty.patch" run_main true
 assert_match    "overlay: ingen endringer"         'overlay: no changes' "$MAIN_ERR"
 if compgen -G "$HR/.sandbox/overlay/code-*.patch" >/dev/null; then bad "overlay: ingen tom patchfil" "finnes"; else ok "overlay: ingen tom patchfil"; fi
 
-FAKE_PODMAN_SANDBOX_RC=3 FAKE_PODMAN_PATCH="$T_TMP/empty.patch" run_main --overlay true
+FAKE_PODMAN_SANDBOX_RC=3 FAKE_PODMAN_PATCH="$T_TMP/empty.patch" run_main true
 assert_eq       "overlay: agentens exit-kode beholdes" 3 "$MAIN_RC"
 if [[ -n "$(helper_run)" ]]; then ok "overlay: patch lages også når agenten feiler"; else bad "overlay: patch lages også når agenten feiler" "ingen hjelper"; fi
 
-FAKE_PODMAN_PATCH="$T_TMP/empty.patch" run_main --overlay --git-rw true
-assert_match    "overlay: --git-rw advarer"        'warn: --git-rw has no effect with --overlay' "$MAIN_ERR"
 rmdir "$HH/proj/.git"; rm -rf "$HR/.sandbox/overlay"
 
 # ------------------------------------- ekstra CA (--ca-cert / SBX_CA_CERTS)
@@ -355,7 +402,7 @@ if compgen -G "$HR/.sandbox/build-ca-*" >/dev/null; then bad "CA: build-fila sle
 run_main --rebuild true
 assert_no_match "CA: uten CA ingen secret"         '--secret' "$(grep -E '^build ' "$PLOG")"
 
-FAKE_PODMAN_SANDBOX_RC=4 run_main true
+FAKE_PODMAN_SANDBOX_RC=4 run_main --work rw true
 assert_eq       "uten overlay: exit-koden beholdes" 4 "$MAIN_RC"
 if [[ -z "$(helper_run)" ]]; then ok "uten overlay: ingen hjelper"; else bad "uten overlay: ingen hjelper" "kjørte"; fi
 

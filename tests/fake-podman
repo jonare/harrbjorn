@@ -11,8 +11,11 @@
 #    each of these present in podman's own environment
 #  - a `-v SRC:/config:ro...` mount (the proxy policy) is copied to
 #    $FAKE_PODMAN_LOG.config/ before the session cleanup removes SRC
-#  - FAKE_PODMAN_PATCH=FILE: a `run` with `-v DIR:/out:z` (the --overlay
-#    patch helper) copies FILE to DIR/changes.patch
+#  - the overlay patch helper (`run` with `-v DIR:/out:z`, no --name)
+#    writes an empty DIR/changes.patch (no changes); FAKE_PODMAN_PATCH=FILE
+#    copies FILE instead, FAKE_PODMAN_PATCH=none writes nothing (failure)
+#  - FAKE_PODMAN_OUT_FILE=NAME: the sandbox run (`--name sbx-...`) with
+#    `-v DIR:/out:z` (--work ro/none) creates DIR/NAME
 #  - FAKE_PODMAN_SANDBOX_RC: exit status of the sandbox run (`run --rm`
 #    with `--name sbx-...`)
 #  - `build --secret id=ID,src=FILE`: FILE is copied to
@@ -22,13 +25,20 @@ if [[ "$1" == run ]]; then
   for k in ${FAKE_PODMAN_ENV_KEYS:-}; do
     [[ -n "${!k+x}" ]] && printf 'env:%s=%s\n' "$k" "${!k}" >> "$FAKE_PODMAN_LOG"
   done
-  prev=""
+  prev="" named=0
+  [[ " $* " == *" --name sbx-"* ]] && named=1
   for a in "$@"; do
     if [[ "$prev" == -v && "$a" == *:/config:ro* ]]; then
       rm -rf "$FAKE_PODMAN_LOG.config"; cp -r "${a%%:*}" "$FAKE_PODMAN_LOG.config"
     fi
-    if [[ "$prev" == -v && "$a" == *:/out:z && -n "${FAKE_PODMAN_PATCH:-}" ]]; then
-      cp "$FAKE_PODMAN_PATCH" "${a%%:*}/changes.patch"
+    if [[ "$prev" == -v && "$a" == *:/out:z ]]; then
+      if (( named )); then
+        [[ -n "${FAKE_PODMAN_OUT_FILE:-}" ]] && echo out > "${a%%:*}/$FAKE_PODMAN_OUT_FILE"
+      elif [[ -z "${FAKE_PODMAN_PATCH:-}" ]]; then
+        : > "${a%%:*}/changes.patch"
+      elif [[ "$FAKE_PODMAN_PATCH" != none ]]; then
+        cp "$FAKE_PODMAN_PATCH" "${a%%:*}/changes.patch"
+      fi
     fi
     prev="$a"
   done

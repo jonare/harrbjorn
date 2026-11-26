@@ -51,7 +51,7 @@ NET_NAME=""
 RESOLV_CONF=""
 POLICY_DIR=""
 SESSION_LOG=""
-OVL_PENDING=""   # --overlay upperdir whose patch is not built yet
+OVL_PENDING=""   # overlay upperdir whose patch is not built yet
 BUILD_CA=""      # extra CAs for the image builds (build secret), removed after
 
 sbx_cleanup() {
@@ -186,8 +186,8 @@ sbx_trusted_model_port() {
 _sbx_under() { [[ "$2" == / || "$1" == "$2" || "$1" == "$2"/* ]]; }
 
 # sbx_check_workdir WORKDIR HOME_DIR REPO_DIR [PROTECTED_FILE...] — refuse a
-# workdir that would give the sandbox rw on something the host runs or
-# trusts: /, $HOME or a parent of it, the harrbjorn repo (lib/, .env,
+# workdir that would give the sandbox (read or, with --work rw, write)
+# access to something the host runs or trusts: /, $HOME or a parent of it, the harrbjorn repo (lib/, .env,
 # .sandbox/ with other sessions' HOMEs and audit logs) or anything above or
 # inside it, and any directory containing a protected file (the model
 # config is eval'ed on the host). Compared on physical paths.
@@ -217,7 +217,7 @@ sbx_check_workdir() {
     done
   fi
   if [[ -n "$why" ]]; then
-    echo "error: refusing workdir $1: $why. The sandbox gets rw on the workdir; pick a project directory instead." >&2
+    echo "error: refusing workdir $1: $why. The workdir is the sandbox's view of the host (and writable with --work rw); pick a project directory instead." >&2
     return 1
   fi
 }
@@ -655,14 +655,14 @@ sbx_ca_pem() {
   done
 }
 
-# ------------------------------------------------------- overlay (--overlay)
+# ------------------------------------------------- overlay (--work overlay)
 # Paths whose content the host runs or loads without asking: direnv, make/
 # just, npm, python build/test hooks, gradle/maven/cargo build scripts,
 # version managers, pre-commit/husky, IDE and CI config, agent config. A
 # review aid, not a guarantee.
 SBX_OVERLAY_SENSITIVE_RE='(^|/)(\.envrc|\.env|[Mm]akefile|GNUmakefile|[Jj]ustfile|package\.json|\.npmrc|\.yarnrc(\.yml)?|setup\.py|conftest\.py|pyproject\.toml|\.pre-commit-config\.yaml|\.gitattributes|\.gitmodules|gradlew|mvnw|build\.gradle(\.kts)?|settings\.gradle(\.kts)?|pom\.xml|build\.rs|\.?mise\.toml|\.tool-versions|CLAUDE\.md|AGENTS\.md|\.gitlab-ci\.yml)$|(^|/)(\.vscode|\.idea|\.claude|\.pi|\.github|\.husky|\.devcontainer|\.cargo|\.mvn|\.direnv)/'
 
-# sbx_overlay_report PATCH WORKDIR — host-side summary of an --overlay
+# sbx_overlay_report PATCH WORKDIR — host-side summary of an overlay
 # patch: diffstat, paths to review before applying (sensitive names,
 # executables, symlinks) and the apply command. Only parses the patch.
 sbx_overlay_report() {
@@ -691,7 +691,7 @@ sbx_overlay_report() {
   printf '   apply:   git -C %q apply %q\n' "$wd" "$patch"
 }
 
-# sbx_overlay_finish OVL WORKDIR PATCH — after an --overlay session: build
+# sbx_overlay_finish OVL WORKDIR PATCH — after an overlay session: build
 # the patch in a networkless helper (same runtime and image as the
 # sandbox; lib/overlay-diff.sh with the untouched workdir as /lower and
 # the overlay as /merged), save it as PATCH and remove the upperdir
@@ -722,6 +722,25 @@ sbx_overlay_finish() {
     return 0
   fi
   sbx_overlay_report "$patch" "$wd" >&2
+}
+
+# ------------------------------------------------- /out (--work ro / none)
+# sbx_out_finish DIR — after a --work ro/none session: remove DIR (the
+# session's /out) when the agent wrote nothing there, else say where it is
+# and list what is in it. Names are agent-chosen: control characters
+# (terminal escapes) are shown as '?'. find does not follow links.
+sbx_out_finish() {
+  local dir="$1" p n=0
+  if rmdir -- "$dir" 2>/dev/null; then
+    echo ">> out: nothing written to /out" >&2
+    return 0
+  fi
+  printf '>> out: the agent'"'"'s /out is kept at %q:\n' "$dir" >&2
+  while IFS= read -r -d '' p; do
+    if (( n++ < 20 )); then printf '     %s\n' "${p//[[:cntrl:]]/?}" >&2; fi
+  done < <(find "$dir" -mindepth 1 -printf '%P\0' 2>/dev/null | sort -z)
+  if (( n > 20 )); then echo "     … ($((n - 20)) more)" >&2; fi
+  return 0
 }
 
 # ------------------------------------------------------------ relay (-p)
@@ -944,7 +963,7 @@ sbx_check_runtime() {
 sbx_main() {
   local WORKDIR="" EXT_PROXY="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
   local HOST_PORTS=()
-  local REBUILD=0 GIT_RW=0 NO_DEFAULT_ALLOWLIST=0 OVERLAY=0 OVL_DIR="" CA_FILES=() CA_PEM="" RESUME=0 RESUME_ID="" LIST_SESSIONS=0 T CONFIG_ENV=() MODEL_ENV=() PROXY_ENV=() MOUNTS=()
+  local REBUILD=0 NO_DEFAULT_ALLOWLIST=0 WORK=overlay OVL_DIR="" OUT_DIR="" CA_FILES=() CA_PEM="" RESUME=0 RESUME_ID="" LIST_SESSIONS=0 T CONFIG_ENV=() MODEL_ENV=() PROXY_ENV=() MOUNTS=()
   local S SBX_NAME PROXY_TRUSTED="" RUNTIME_ARGS=()
 
   while [[ $# -gt 0 ]]; do
@@ -959,9 +978,9 @@ sbx_main() {
           EXTRA_ALLOWLIST="$2"; shift 2 ;;
       -p) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
           EXT_PROXY="$2"; shift 2 ;;
+      --work) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
+          WORK="$2"; shift 2 ;;
       --rebuild) REBUILD=1; shift ;;
-      --git-rw) GIT_RW=1; shift ;;
-      --overlay) OVERLAY=1; shift ;;
       --resume) RESUME=1; shift ;;
       --resume=*) RESUME=1; RESUME_ID="${1#--resume=}"; shift ;;
       --sessions) LIST_SESSIONS=1; shift ;;
@@ -974,6 +993,10 @@ sbx_main() {
       *) break ;;  # first non-flag argument starts the command; `--` is optional
     esac
   done
+  case "$WORK" in
+    overlay|ro|rw|rw+git|none) ;;
+    *) echo "error: --work: unknown mode '$WORK' (overlay, ro, rw, rw+git or none)" >&2; sbx_usage 1 ;;
+  esac
   # No command → default to an interactive bash in the workdir: a bare
   # `harrbjorn code` / `harrbjorn security` drops you into a shell to poke
   # around (the TTY handling below attaches a terminal — -it — when one is
@@ -983,7 +1006,9 @@ sbx_main() {
   else
     local CMD=(bash)
   fi
-  # -w is optional: the workspace defaults to the current directory.
+  # -w is optional: the workspace defaults to the current directory. It is
+  # defined in every --work mode, also none: it keys the session (agent
+  # HOME) and identifies the project.
   WORKDIR="${WORKDIR:-$PWD}"
   [[ -d "$WORKDIR" ]] || { echo "error: workdir $WORKDIR does not exist" >&2; exit 1; }
   # Physical path (symlinks resolved): the guard, the agent-HOME key and the
@@ -1113,7 +1138,8 @@ sbx_main() {
   # same vars, so both harnesses share the model.
   local SBX_CLAUDE_CONFIG="${SBX_CLAUDE_CONFIG:-$HOME/claude.sh}"
   # Workdir guard before anything is evaluated or created: the workdir is
-  # mounted rw, so it must not contain anything the host runs or trusts.
+  # the sandbox's view of the host (rw with --work rw), so it must not
+  # contain anything the host runs or trusts. Applied in every mode.
   sbx_check_workdir "$WORKDIR_ABS" "$HOME" "$SCRIPT_DIR" "$SBX_CLAUDE_CONFIG" || exit 1
 
   # ------------------------------------------------------------- session
@@ -1379,38 +1405,48 @@ sbx_main() {
   fi
 
   # ------------------------------------------------------------- mounts
-  # The workdir is rw, but its .git is mounted read-only on top unless
-  # --git-rw: git config (core.fsmonitor, core.hooksPath, ...) and hooks
-  # written by the agent would run on the HOST at the next git command
-  # there — many shell prompts run `git status` on cd. Only an existing
-  # top-level .git directory is covered: a .git the agent creates (also in
-  # a subdirectory, or when the workdir is not a repo) and a .git file
-  # (worktree/submodule, which the agent can repoint) stay writable. That
-  # limit is documented; --overlay is the mode that covers them.
-  #
-  # --overlay instead: /work is an overlay over the workdir with a
-  # per-session upperdir — the host's workdir (and .git) is never written
-  # or relabeled during the session; the changes come out as a patch
-  # afterwards (sbx_overlay_finish).
-  if (( OVERLAY )); then
-    OVL_DIR="$STATE_DIR/overlay/$S"
-    mkdir -p "$OVL_DIR/up" "$OVL_DIR/wk" "$OVL_DIR/out"
-    chmod 0700 "$OVL_DIR"
-    OVL_PENDING="$OVL_DIR"
-    MOUNTS=(-v "$WORKDIR_ABS:/work:O,upperdir=$OVL_DIR/up,workdir=$OVL_DIR/wk")
-    if (( GIT_RW )); then
-      echo "warn: --git-rw has no effect with --overlay (the host's .git is never written)." >&2
-    fi
-  else
-    MOUNTS=(-v "$WORKDIR_ABS:/work:z")
-  fi
-  if (( ! OVERLAY )) && [[ -d "$WORKDIR_ABS/.git" && ! -L "$WORKDIR_ABS/.git" ]]; then
-    if (( GIT_RW )); then
-      echo "warn: --git-rw: the agent can write .git (hooks, config); git run on the host in $WORKDIR_ABS will execute what it plants." >&2
-    else
-      MOUNTS+=(-v "$WORKDIR_ABS/.git:/work/.git:ro")
-    fi
-  fi
+  # --work selects what the sandbox gets of the workdir:
+  #  overlay (default) — /work is an overlay over the workdir with a
+  #    per-session upperdir: the host's workdir (and .git) is never written
+  #    or relabeled during the session; the changes come out as a patch
+  #    afterwards (sbx_overlay_finish).
+  #  ro / none — the workdir read-only at /work, or not mounted at all; the
+  #    agent's way out is a writable /out per session (.sandbox/out/<S>,
+  #    shown afterwards by sbx_out_finish).
+  #  rw — the workdir is rw, but its .git is mounted read-only on top: git
+  #    config (core.fsmonitor, core.hooksPath, ...) and hooks written by the
+  #    agent would run on the HOST at the next git command there — many
+  #    shell prompts run `git status` on cd. Only an existing top-level .git
+  #    directory is covered: a .git the agent creates (also in a
+  #    subdirectory, or when the workdir is not a repo) and a .git file
+  #    (worktree/submodule, which the agent can repoint) stay writable.
+  #  rw+git — rw without the .git cover.
+  case "$WORK" in
+    overlay)
+      OVL_DIR="$STATE_DIR/overlay/$S"
+      mkdir -p "$OVL_DIR/up" "$OVL_DIR/wk" "$OVL_DIR/out"
+      chmod 0700 "$OVL_DIR"
+      OVL_PENDING="$OVL_DIR"
+      MOUNTS=(-v "$WORKDIR_ABS:/work:O,upperdir=$OVL_DIR/up,workdir=$OVL_DIR/wk")
+      ;;
+    ro|none)
+      OUT_DIR="$STATE_DIR/out/$S"
+      mkdir -p "$OUT_DIR"
+      chmod 0700 "$OUT_DIR"
+      MOUNTS=(-v "$OUT_DIR:/out:z")
+      [[ "$WORK" == ro ]] && MOUNTS=(-v "$WORKDIR_ABS:/work:ro,z" "${MOUNTS[@]}")
+      ;;
+    rw|rw+git)
+      MOUNTS=(-v "$WORKDIR_ABS:/work:z")
+      if [[ -d "$WORKDIR_ABS/.git" && ! -L "$WORKDIR_ABS/.git" ]]; then
+        if [[ "$WORK" == rw+git ]]; then
+          echo "warn: --work rw+git: the agent can write .git (hooks, config); git run on the host in $WORKDIR_ABS will execute what it plants." >&2
+        else
+          MOUNTS+=(-v "$WORKDIR_ABS/.git:/work/.git:ro")
+        fi
+      fi
+      ;;
+  esac
 
   # ------------------------------------------------------------- sandbox
   # -i is always required so stdin reaches the container; -t only with a TTY.
@@ -1419,7 +1455,7 @@ sbx_main() {
   T="-i"
   [[ -t 0 && -t 1 ]] && T="-it"
 
-  echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS agent_home=$AGENT_HOME cmd=${CMD[*]}${MODE_TAG}"
+  echo ">> sandbox [$SBX_USECASE]: image=$SBX_IMAGE workdir=$WORKDIR_ABS work=$WORK agent_home=$AGENT_HOME cmd=${CMD[*]}${MODE_TAG}"
   # Subshell: MODEL_ENV is exported for this podman process only (traps are
   # reset in the subshell, so the session cleanup still runs once, here).
   local rc=0
@@ -1452,9 +1488,10 @@ sbx_main() {
   #  model-catalog refreshes stay possible and go through the proxy.)
 
   echo ">> session $SESSION_ID kept: resume with --resume (most recent) or --resume=$SESSION_ID" >&2
-  if (( OVERLAY )); then
+  if [[ "$WORK" == overlay ]]; then
     sbx_overlay_finish "$OVL_DIR" "$WORKDIR_ABS" "$STATE_DIR/overlay/$S.patch" \
       || { (( rc )) || rc=1; }
   fi
+  if [[ -n "$OUT_DIR" ]]; then sbx_out_finish "$OUT_DIR"; fi
   return "$rc"
 }

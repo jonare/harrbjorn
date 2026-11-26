@@ -19,7 +19,7 @@ done
 
 for w in run-code.sh run-pentest.sh; do
   out="$(bash "$T_REPO/$w" -h 2>&1)"
-  for f in -w -a -H -f -p --rebuild --git-rw --no-default-allowlist --overlay --ca-cert --resume --sessions; do
+  for f in -w -a -H -f -p --rebuild --no-default-allowlist --work --ca-cert --resume --sessions; do
     assert_match "$w -h nevner $f" "(^|[[ ])$f([] ]|$)" "$out"
   done
 done
@@ -30,8 +30,19 @@ for w in run-code.sh run-pentest.sh; do
   assert_no_match "$w setter ikke SBX_OPEN_NETWORK" 'SBX_OPEN_NETWORK' "$(grep -v '^#' "$T_REPO/$w")"
 done
 
+# --work-modusene står i hjelpen; de fjernede flaggene står ingen steder.
+for w in run-code.sh run-pentest.sh; do
+  out="$(bash "$T_REPO/$w" -h 2>&1)"
+  for m in overlay ro rw rw+git none; do
+    assert_match "$w -h nevner --work $m" "(^|[^a-z+])${m//+/\\+}([^a-z+]|$)" "$out"
+  done
+done
+for w in run-code.sh run-pentest.sh harrbjorn README.md; do
+  assert_no_match "$w nevner ikke --overlay/--git-rw" '(--overlay|--git-rw)([^-a-z]|$)' "$(cat "$T_REPO/$w")"
+done
+
 comp="$(bash "$T_REPO/harrbjorn" completion)"
-for f in -w -a -H -f -p --rebuild --git-rw --no-default-allowlist --overlay --ca-cert --resume --sessions; do
+for f in -w -a -H -f -p --rebuild --no-default-allowlist --work --ca-cert --resume --sessions; do
   assert_match "completion har $f" "(^|[\" ])$f( |\")" "$comp"
 done
 

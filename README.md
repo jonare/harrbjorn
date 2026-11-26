@@ -41,7 +41,9 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
   loopback-, link-local- og CGNAT-adresser avvises med mindre en IP-literal
   i allowlisten eller trusted-settet slipper dem. Hostens tjenester nås
   bare via trusted-portene (modellport, `-H`).
-- **Filsystem:** agenten skriver bare i `/work` og sin økts HOME
+- **Filsystem:** agenten skriver bare i `/work` (som standard en overlay:
+  workdir på hosten røres ikke, se [Workdir](#workdir---work)), `/out`
+  (med `--work ro`/`none`) og sin økts HOME
   (`.sandbox/agent-home/<usecase>/<basename>-<hash>/<økt>`); rotfilsystemet
   er read-only. En ny økt starter med tom HOME, så tidligere økter påvirker
   den ikke; `--resume` gjenbruker en økt eksplisitt (se
@@ -51,12 +53,12 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
 
 **Det harrbjorn ikke beskytter mot:**
 
-- **Kode agenten legger i workdir.** Uten `--overlay` skriver agenten rett
-  i workdir, og hosten kjører senere det som ligger der: `Makefile`,
-  `package.json`-scripts, `.envrc`, IDE-oppgaver, pre-commit-hooks. Bruk
-  `--overlay` for upålitelige kjøringer, og les patchen før du bruker den.
-- **`.git` utenfor den beskyttede katalogen.** Bare en eksisterende
-  `.git`-katalog øverst i workdir monteres read-only. En `.git` agenten
+- **Kode agenten legger i workdir.** Hosten kjører senere det som ligger
+  der: `Makefile`, `package.json`-scripts, `.envrc`, IDE-oppgaver,
+  pre-commit-hooks. I overlay-modus (default) kommer det som en patch du
+  må lese før du bruker den; med `--work rw` skriver agenten rett i workdir.
+- **`.git` utenfor den beskyttede katalogen (`--work rw`).** Bare en
+  eksisterende `.git`-katalog øverst i workdir monteres read-only. En `.git` agenten
   lager (også i underkataloger, eller når workdir ikke er et repo), og en
   `.git`-fil (worktree/submodul), er skrivbar — git på hosten kjører det
   som plantes der (`core.fsmonitor`, hooks), f.eks. ved neste `git status`.
@@ -293,17 +295,16 @@ Flagg (identiske i begge):
 
 | Flag | Effekt |
 |---|---|
-| `-w DIR` | Workspace (bindmount til `/work`, rw). Default: gjeldende workdir. |
+| `-w DIR` | Workdir (`/work`, se `--work`). Default: gjeldende katalog. |
+| `--work MODE` | Hva sandboxen får av workdir: `overlay` (default; workdir urørt, endringene som patch), `ro` (read-only + skrivbar `/out`), `none` (ikke montert; `/out`), `rw` (skrivbar, `.git` read-only) eller `rw+git` (også `.git` skrivbar; wrapperen advarer). Se [Workdir](#workdir---work). |
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). `-a '*'` gir åpen utgang; IP-literaler gjelder også i åpen modus (unntak fra IP-filteret). |
 | `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream — se [Host-tjenester](#host-tjenester). |
 | `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten; en linje `*` gir åpen utgang). |
 | `-p host:port` | Ekstern forward-proxy (f.eks. Burp Suite; den må lytte utover loopback, se [Host-tjenester](#host-tjenester)) med harrbjorns proxy som upstream på `127.0.0.1:3129` — allowlisten gjelder. Nettet er fortsatt `--internal`, og en relay videresender kun til proxyen, modellporten og `-H`-portene. Fail-closed — se [Ekstern proxy](#ekstern-proxy--p). |
 | `--no-default-allowlist` | Allowlist-modus uten default-allowlisten: kun `-a`/`-f` og den trusted modellporten. Profil for lokal modell (LLM-API-, GitHub- og pakkeregister-hostene er exfil-kanaler). Uten virkning med `-a '*'`. |
-| `--git-rw` | Monter workdirens `.git` skrivbar. Default: en eksisterende `.git`-katalog øverst i workdir monteres read-only — se [Trusselmodell](#trusselmodell) for hva det ikke dekker. Wrapperen advarer. |
 | `--ca-cert FILE` | Ekstra CA-sertifikat (PEM/DER, kan gjentas) å stole på i bildebyggene og i sandboxen, f.eks. roten til en TLS-inspiserende mellomboks. Se [Ekstra CA](#ekstra-ca---ca-cert). |
 | `--resume[=ID]` | Gjenbruk HOME-en til sist brukte økt (eller økt `ID`) i samme workdir og usecase, som den var. Uten flagget får økten en ny, tom HOME. Se [Økter](#økter-og-resume). |
 | `--sessions` | List øktene for workdir + usecase (ID, sist brukt, størrelse) og avslutt. |
-| `--overlay` | `/work` blir en overlay: workdir på hosten (også `.git`) røres ikke under økten. Endringene kommer ut som en patch du ser over og bruker med `git apply`. Se [Overlay](#overlay---overlay). |
 | `--rebuild` | Bygg bilder + proxy på nytt (claude/pi låses ved build; se Begrensninger). |
 
 Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
@@ -532,14 +533,39 @@ harrbjorn code --resume=code-1795694761-1318814 pi -r
 - Resume tar med alt økta hadde, også det et mål eventuelt plantet
   (prompt injection i samtalen, hooks, verktøy). Det er det eksplisitte
   valget; en ny økt er ren.
-- Workdir (`/work`) er ikke en del av økta: endringer der (f.eks.
-  prosjektets `.claude/settings.json` eller `CLAUDE.md`) ser også neste nye
-  økt. Bruk `--overlay` for å holde workdir urørt.
+- Workdir (`/work`) er ikke en del av økta: med `--work rw` ser også neste
+  nye økt endringer der (f.eks. prosjektets `.claude/settings.json` eller
+  `CLAUDE.md`). I overlay-modus (default) når de workdir bare når du
+  bruker patchen.
 - Økter fra før denne ordningen ligger på den gamle stien og vises ikke.
 
-## Overlay (`--overlay`)
+## Workdir (`--work`)
 
-Opt-in i begge usecases. `/work` monteres som en overlay over workdir med
+`--work MODE` bestemmer hva sandboxen får av workdir (`-w`, ellers
+gjeldende katalog). Workdir er alltid definert, også med `none`: den er
+nøkkelen til øktene og prosjektets identitet, og workdir-sperren gjelder i
+alle moduser.
+
+| Modus | `/work` | Ut av sandboxen |
+|---|---|---|
+| `overlay` (default) | overlay over workdir; workdir urørt | patch (`.sandbox/overlay/<sesjon>.patch`) |
+| `ro` | workdir read-only | `/out` (`.sandbox/out/<sesjon>/`) |
+| `none` | ikke montert (tom) | `/out` (`.sandbox/out/<sesjon>/`) |
+| `rw` | workdir skrivbar, eksisterende `.git` øverst read-only | direkte i workdir |
+| `rw+git` | workdir skrivbar, også `.git` (wrapperen advarer) | direkte i workdir, også hooks og git-config |
+
+Med `ro` og `none` får økten en tom, skrivbar `/out`. Etter økten skrives
+stien og innholdet ut; skrev agenten ingenting der, fjernes katalogen.
+
+```bash
+harrbjorn code claude                        # overlay
+harrbjorn code --work ro claude -p "Gå gjennom koden, skriv funnene til /out/review.md"
+harrbjorn code --work rw claude              # agenten skriver rett i workdir
+```
+
+### Overlay
+
+`/work` monteres som en overlay over workdir med
 en upperdir per sesjon (`.sandbox/overlay/<sesjon>/`). Agenten ser og
 endrer workdir som vanlig, men alle skriv havner i upperdir: workdir på
 hosten — også `.git` — røres ikke og relabeles ikke (SELinux).
@@ -556,7 +582,7 @@ som kan kjøres (f.eks. låsefiler, `*.config.js`, testfiler), og binære
 differ kan ikke leses:
 
 ```bash
-harrbjorn code --overlay claude
+harrbjorn code claude
 # …
 git -C <workdir> apply .sandbox/overlay/<sesjon>.patch
 ```
@@ -779,7 +805,8 @@ mkdir -p /tmp/sbx-a
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter. Det relabeler workdir og
   økt-HOME varig til en delt containerlabel (ingen SELinux-separasjon
-  mellom økter); med `--overlay` relabeles ikke workdir.
+  mellom økter); med `--work overlay` (default) og `none` relabeles ikke
+  workdir.
 - krun-microVM-er (default-runtime): ~90 MB minne per VM (sandbox + proxy)
   og oppstarts-tak i sekunder; bindmounter går via virtio-fs.
   `SBX_RUNTIME=crun` (eksplisitt) fjerner VM-laget — en container-escape
