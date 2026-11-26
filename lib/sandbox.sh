@@ -15,8 +15,9 @@
 # Runtime: rootless Podman, --userns=keep-id, per-sesjon nett (podman network
 # --internal) med per-sesjon proxy som eneste utgang. Med -p er nettet
 # fortsatt --internal, og en relay til den eksterne proxyen (+ modellport og
-# -H-porter) er eneste utgang (fail-closed: ingen fallback hvis proxyen ikke
-# svarer). Ingen sudo: hosten berøres aldri
+# -H-porter) er eneste utgang; den eksterne proxyen har per-sesjon-proxyen
+# som upstream, så allowlisten gjelder også da (fail-closed: ingen fallback
+# hvis proxyen ikke svarer eller ikke sender videre). Ingen sudo: hosten berøres aldri
 # (nattverks-isolasjon kjører i nettverket, ikke i iptables).
 #
 # OCI-runtime (SBX_RUNTIME): krun (microVM via KVM, default), runsc (gVisor)
@@ -577,6 +578,27 @@ sbx_tcp_probe() {
   timeout 5 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$h" "$2" 2>/dev/null
 }
 
+# sbx_http_probe URL — true if something answers HTTP at URL within 2s,
+# checked from the host (any status counts; no proxy from the env).
+sbx_http_probe() { curl -s -o /dev/null --max-time 2 --noproxy '*' "$1" 2>/dev/null; }
+
+# sbx_burp_chained PROXY EXTERNAL — true if the external forward proxy at
+# EXTERNAL (host:port, as the host reaches it) sends requests on to
+# harrbjorn's proxy container PROXY: a request for a random canary name is
+# sent through EXTERNAL from the host and must show up in PROXY's decision
+# log (allowed or denied — only that it got there). The name is never
+# resolvable, so an external proxy that connects directly gets nowhere.
+sbx_burp_chained() {
+  local proxy="$1" ext="$2" canary _
+  canary="sbx-canary-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n').invalid"
+  curl -s -o /dev/null --max-time 15 --noproxy '' -x "http://$ext" "http://$canary/" 2>/dev/null || true
+  for _ in $(seq 1 20); do   # the log may lag behind the decision
+    $PODMAN logs "$proxy" 2>&1 | grep -qF "\"requested_host\":\"$canary" && return 0
+    sleep 0.5
+  done
+  return 1
+}
+
 # sbx_wait_tcp NET IP PORT... — wait (up to 90s) until every PORT answers on
 # IP, probed from a throwaway container on NET: the exact path a sandboxed
 # request takes, so "answered" means "will serve". The alternatives are
@@ -748,12 +770,21 @@ sbx_start_relay() {
 # ------------------------------------------------------------ proxy
 # Start harrbjorn's own egress: merged allowlist → Smokescreen policy →
 # per-session resolv.conf → per-session proxy container → readiness probe.
-# The whole section runs only when harrbjorn's proxy is the egress; with -p
-# the external proxy is the firewall and none of this is created.
 # RESOLV_CONF / POLICY_DIR / PROXY_NAME are globals so sbx_cleanup can
 # release them (PROXY_PORT is a top-level constant).
+#
+# sbx_start_proxy S MODE_TAG [UPSTREAM_PORT] — with UPSTREAM_PORT (-p) the
+# proxy is the external proxy's upstream instead of the sandbox's egress:
+# sandbox → relay → external proxy (Burp) → this proxy → target. It is
+# published on 127.0.0.1:UPSTREAM_PORT only (the external proxy on the host
+# reaches it there, the LAN does not) and sits on pasta's default network
+# alone — not on the session net, so the sandbox reaches it only through
+# the external proxy. The trusted host ports (model, -H) go through the
+# relay and are never opened here. Ordered this way round, Smokescreen
+# resolves and connects itself, so the ACL and IP filter hold for the
+# address it dials; the external proxy's own lookups do not matter.
 sbx_start_proxy() {
-  local S="$1" MODE_TAG="$2" MERGED
+  local S="$1" MODE_TAG="$2" UPSTREAM_PORT="${3:-}" MERGED
 
   # --------------------------------------------------------- allowlist
   mkdir -p "$STATE_DIR"
@@ -786,7 +817,11 @@ sbx_start_proxy() {
   # (the EXIT trap cleans up what exists so far).
   POLICY_DIR="$STATE_DIR/proxy-$S"
   mkdir -p "$POLICY_DIR"
-  sbx_write_proxy_policy "$POLICY_DIR" || exit 1
+  if [[ -n "$UPSTREAM_PORT" ]]; then
+    PROXY_TRUSTED="" sbx_write_proxy_policy "$POLICY_DIR" || exit 1   # host ports: relay only
+  else
+    sbx_write_proxy_policy "$POLICY_DIR" || exit 1
+  fi
 
   # ------------------------------------------------------------- proxy
   # Per-session proxy: one hop on pasta's default network (real egress +
@@ -811,11 +846,16 @@ sbx_start_proxy() {
     echo "# per-session proxy nameservers (written by harrbjorn $SBX_USECASE)"
     while IFS= read -r ns; do echo "nameserver $ns"; done <<< "$DNS"
   } > "$RESOLV_CONF"
-  echo ">> proxy $PROXY_NAME: starting (net $NET_NAME${MODE_TAG}, dns: $(printf '%s' "$DNS" | tr '\n' ' '))"
-  $PODMAN run -d --name "$PROXY_NAME" \
+  local nets=(--network podman --network "$NET_NAME") where="net $NET_NAME"
+  if [[ -n "$UPSTREAM_PORT" ]]; then
+    nets=(--network podman -p "127.0.0.1:$UPSTREAM_PORT:$PROXY_PORT")
+    where="127.0.0.1:$UPSTREAM_PORT, upstream of the external proxy"
+  fi
+  echo ">> proxy $PROXY_NAME: starting ($where${MODE_TAG/, external proxy/}, dns: $(printf '%s' "$DNS" | tr '\n' ' '))"
+  if ! $PODMAN run -d --name "$PROXY_NAME" \
     "${RUNTIME_ARGS[@]}" \
     --userns=keep-id:uid=1000,gid=1000 \
-    --network podman --network "$NET_NAME" \
+    "${nets[@]}" \
     -v "$RESOLV_CONF:/etc/resolv.conf:ro,z" \
     -v "$POLICY_DIR:/config:ro,z" \
     --read-only --tmpfs /tmp \
@@ -823,18 +863,30 @@ sbx_start_proxy() {
     --user 65534:65534 \
     --memory 256m --pids-limit 128 --ulimit "nofile=$SBX_NOFILE:$SBX_NOFILE" \
     harrbjorn/sbx-proxy:latest \
-    --config-file /config/proxy.yaml >/dev/null
+    --config-file /config/proxy.yaml >/dev/null; then
+    if [[ -n "$UPSTREAM_PORT" ]]; then
+      echo "error: -p: could not publish harrbjorn's proxy on 127.0.0.1:$UPSTREAM_PORT (in use by another -p session? set SBX_UPSTREAM_PORT)." >&2
+    fi
+    exit 1
+  fi
   # Wait until the proxy is ready (see sbx_wait_tcp). A config/ACL that
   # fails Validate never binds the socket, so the deadline fires and the
-  # error path below does the rest.
-  local PROXY_IP
-  PROXY_IP="$($PODMAN inspect \
-    -f "{{(index .NetworkSettings.Networks \"$NET_NAME\").IPAddress}}" "$PROXY_NAME")"
-  if sbx_wait_tcp "$NET_NAME" "$PROXY_IP" "$PROXY_PORT"; then
+  # error path below does the rest. The upstream proxy is not on the
+  # session net; the host reaches it on the published port.
+  local PROXY_IP ready=0 _
+  if [[ -n "$UPSTREAM_PORT" ]]; then
+    PROXY_IP="127.0.0.1:$UPSTREAM_PORT"
+    for _ in $(seq 1 180); do sbx_http_probe "http://$PROXY_IP/" && { ready=1; break; }; sleep 0.5; done
+  else
+    PROXY_IP="$($PODMAN inspect \
+      -f "{{(index .NetworkSettings.Networks \"$NET_NAME\").IPAddress}}" "$PROXY_NAME")"
+    sbx_wait_tcp "$NET_NAME" "$PROXY_IP" "$PROXY_PORT" && ready=1
+  fi
+  if (( ready )); then
     echo ">> proxy is up"
   else
     {
-      echo "error: proxy failed to start (no answered connect to $PROXY_IP:3128 within 90s)." >&2
+      echo "error: proxy failed to start (no answer from $PROXY_IP within 90s)." >&2
       echo "--- last proxy log lines:" >&2
       $PODMAN logs "$PROXY_NAME" 2>&1 | tail -5 >&2 || true
       echo "  (rerun to reproduce; the proxy container is removed on exit)" >&2
@@ -940,18 +992,20 @@ sbx_main() {
   WORKDIR_ABS="$(cd "$WORKDIR" && pwd -P)"
 
   # -------------------------------------------------------- external proxy
-  # -p host:port: an external forward proxy (e.g. Burp Suite) takes over
-  # egress: harrbjorn's Smokescreen proxy is NOT started and its allowlist
-  # is NOT enforced. The session net stays --internal all the same: proxy
-  # env vars are only a hint a hostile agent ignores, so the "no raw egress"
+  # -p host:port: an external forward proxy (e.g. Burp Suite) sees the
+  # sandbox's traffic: sandbox → relay → external proxy → harrbjorn's
+  # Smokescreen (its upstream, see sbx_start_proxy) → target. The allowlist
+  # is enforced as without -p. The session net stays --internal: proxy env
+  # vars are only a hint a hostile agent ignores, so the "no raw egress"
   # layer must not depend on them. A per-session relay (sbx_start_relay) is
   # the sandbox's only way out — to the external proxy, the model server and
   # the -H ports, nothing else. Fail-closed: if nothing answers on the port
-  # the session aborts before any resource exists — no fallback to the
-  # per-session proxy or an open network. The check runs from the host,
+  # the session aborts before any resource exists, and if the external
+  # proxy does not send on to Smokescreen (sbx_burp_chained) it aborts
+  # before the sandbox starts — no fallback. The checks run from the host,
   # with the address as given (host.containers.internal only exists inside
   # container nets).
-  local ext_host ext_port ext_target
+  local ext_host ext_port ext_target ext_from_host
   if [[ -n "$EXT_PROXY" ]]; then
     ext_host="${EXT_PROXY%:*}"; ext_port="${EXT_PROXY##*:}"
     ext_host="${ext_host#[}"; ext_host="${ext_host%]}"
@@ -960,9 +1014,8 @@ sbx_main() {
       echo "error: -p: bad proxy '$EXT_PROXY' (need host:port, port 1-65535)" >&2
       sbx_usage 1
     fi
-    if (( ${#EXTRA_HOSTS[@]} )) || [[ -n "$EXTRA_ALLOWLIST" ]]; then
-      echo "warn: -a/-f have no effect with -p (harrbjorn's proxy is not started; the external proxy decides what is reachable)." >&2
-    fi
+    ext_from_host="$ext_host:$ext_port"
+    [[ "$ext_host" == *:* ]] && ext_from_host="[$ext_host]:$ext_port"
     if ! sbx_tcp_probe "$ext_host" "$ext_port"; then
       echo "error: -p: no forward proxy answering at $EXT_PROXY (fail-closed: no fallback, session not started)." >&2
       exit 1
@@ -1010,14 +1063,24 @@ sbx_main() {
   # sbx_check_runtime (below, after the podman checks) — no silent fallback.
   local SBX_RUNTIME="${SBX_RUNTIME:-krun}"
   local MODE_TAG=""
-  if (( OPEN_EGRESS )) && [[ -z "$EXT_PROXY" ]]; then
+  if (( OPEN_EGRESS )); then
     MODE_TAG=", open network"
     echo "warn: open egress ('*' in the allowlist): every public destination is reachable (logged; private, loopback and link-local stay blocked)." >&2
   fi
-  if (( NO_DEFAULT_ALLOWLIST )) && { (( OPEN_EGRESS )) || [[ -n "$EXT_PROXY" ]]; }; then
-    echo "warn: --no-default-allowlist has no effect with open egress or -p (no allowlist is enforced)." >&2
+  if (( NO_DEFAULT_ALLOWLIST && OPEN_EGRESS )); then
+    echo "warn: --no-default-allowlist has no effect with open egress (no allowlist is enforced)." >&2
   fi
-  [[ -n "$EXT_PROXY" ]] && MODE_TAG=", external proxy"
+  # -p: the port harrbjorn's proxy is published on as the external proxy's
+  # upstream. Fixed (the external proxy's upstream setting is static), so
+  # one -p session at a time per port.
+  local SBX_UPSTREAM_PORT="${SBX_UPSTREAM_PORT:-3129}"
+  if [[ -n "$EXT_PROXY" ]]; then
+    MODE_TAG+=", external proxy"
+    if [[ ! "$SBX_UPSTREAM_PORT" =~ ^[0-9]{1,5}$ ]] || ! (( SBX_UPSTREAM_PORT >= 1 && SBX_UPSTREAM_PORT <= 65535 )); then
+      echo "error: SBX_UPSTREAM_PORT must be a port 1-65535 (got '$SBX_UPSTREAM_PORT')." >&2
+      exit 1
+    fi
+  fi
 
   # ----------------------------------------------------------- extra CAs
   # --ca-cert FILE (repeatable) + SBX_CA_CERTS (colon-separated; env/.env):
@@ -1160,7 +1223,7 @@ sbx_main() {
       fi
       RELAY_SPECS+=("$tp:host.containers.internal:$tp")
     done
-    echo ">> external proxy: $EXT_PROXY via relay (${RELAY_SPECS[*]}; harrbjorn's proxy is not started)"
+    echo ">> external proxy: $EXT_PROXY via relay (${RELAY_SPECS[*]}); its upstream: harrbjorn's proxy on 127.0.0.1:$SBX_UPSTREAM_PORT"
   fi
 
   # ----------------------------------------------------------- podman check
@@ -1220,11 +1283,10 @@ sbx_main() {
     build_image harrbjorn/code:latest code
   fi
   build_image "$SBX_IMAGE" "$SBX_CONTEXT"
-  # The Smokescreen image is only needed when harrbjorn runs its own proxy;
-  # with -p the external proxy is the egress and the image is never pulled.
-  if [[ -z "$EXT_PROXY" ]]; then
-    build_image harrbjorn/sbx-proxy:latest proxy
-  else
+  # Smokescreen always (with -p as the external proxy's upstream); the relay
+  # only with -p.
+  build_image harrbjorn/sbx-proxy:latest proxy
+  if [[ -n "$EXT_PROXY" ]]; then
     build_image harrbjorn/sbx-relay:latest relay
   fi
   if [[ -n "$BUILD_CA" ]]; then rm -f "$BUILD_CA"; BUILD_CA=""; fi
@@ -1232,12 +1294,18 @@ sbx_main() {
   # ----------------------------------------------------------- network
   # Always --internal: the sandbox has no route anywhere; its only way out is
   # harrbjorn's proxy (allowlist → policy → proxy → readiness) or, with -p,
-  # the relay to the external proxy.
+  # the relay to the external proxy, whose upstream is harrbjorn's proxy.
   $PODMAN network create --internal "$NET_NAME" >/dev/null
+  PROXY_NAME="sbx-$S-proxy"
   if [[ -n "$EXT_PROXY" ]]; then
     sbx_start_relay "$S" "${RELAY_SPECS[@]}"
+    sbx_start_proxy "$S" "$MODE_TAG" "$SBX_UPSTREAM_PORT"
+    if ! sbx_burp_chained "$PROXY_NAME" "$ext_from_host"; then
+      echo "error: -p: $EXT_PROXY does not send requests on to harrbjorn's proxy (canary never arrived). Make it the external proxy's upstream — in Burp: Settings > Network > Connections > Upstream proxy servers: destination host *, proxy 127.0.0.1:$SBX_UPSTREAM_PORT. Fail-closed: session not started." >&2
+      exit 1
+    fi
+    echo ">> external proxy sends on to harrbjorn's proxy (canary seen)"
   else
-    PROXY_NAME="sbx-$S-proxy"
     sbx_start_proxy "$S" "$MODE_TAG"
   fi
 

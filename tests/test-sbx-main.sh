@@ -74,13 +74,38 @@ rmdir "$HH/proj/.git"
 # eksterne proxyen, modellporten og -H-portene. I sandboxen peker
 # host.containers.internal på relayen, så modell-URL-er og -H-URL-er virker
 # uendret, og agenten når ingenting annet direkte.
+#
+# Allowlisten gjelder også med -p: harrbjorns Smokescreen er Burps
+# upstream-proxy (sandbox → relay → Burp → Smokescreen → mål), publisert
+# kun på hostens loopback og ikke koblet til sesjonsnettet — sandboxen når
+# den bare gjennom Burp. Trusted host-porter går via relayen, aldri via
+# Smokescreen. Før sandboxen starter sjekkes det at Burp faktisk sender
+# videre til Smokescreen (kanari); ellers fail-closed.
 printf 'export ANTHROPIC_BASE_URL=http://localhost:8000\nexport ANTHROPIC_API_KEY=k\n' > "$HH/claude.sh"
 relay_run() { grep -E '^run -d --name sbx-code-[0-9]+-[0-9]+-relay ' "$PLOG" | tail -1; }
+upstream_run() { grep -E '^run -d --name sbx-code-[0-9]+-[0-9]+-proxy ' "$PLOG" | tail -1; }
 
 run_main -p 127.0.0.1:4321 -H 9443 true
 assert_eq    "-p: exit 0"                          0 "$MAIN_RC"
 if plog_has "network create --internal sbx-code-"; then ok "-p: nettet er --internal"; else bad "-p: nettet er --internal" "$(grep '^network create' "$PLOG")"; fi
-if plog_has "harrbjorn/sbx-proxy:latest"; then bad "-p: Smokescreen startes ikke" "startet"; else ok "-p: Smokescreen startes ikke"; fi
+U="$(upstream_run)"
+assert_match    "-p: Smokescreen startes"                   ' harrbjorn/sbx-proxy:latest ' "$U"
+assert_match    "-p: Smokescreen publisert kun på loopback" ' -p 127\.0\.0\.1:3129:3128 ' "$U"
+assert_match    "-p: Smokescreen på podman-nettet"          ' --network podman ' "$U"
+assert_no_match "-p: Smokescreen ikke på sesjonsnettet"     '--network sbx-code-[0-9]+-[0-9]+-int' "$U"
+for f in '--read-only' '--cap-drop ALL' '--security-opt no-new-privileges' '--user 65534:65534'; do
+  assert_match  "-p: Smokescreen herdet ($f)"               " $f " "$U"
+done
+assert_no_match "-p: ingen trusted host-porter i Smokescreen" '169\.254\.1\.2' "$(cat "$PLOG.config/proxy.yaml" 2>/dev/null)"
+assert_match    "-p: allowlisten håndheves"                 'action: enforce' "$(cat "$PLOG.config/acl.yaml" 2>/dev/null)"
+assert_match    "-p: default-allowlisten med"               'api\.anthropic\.com' "$(cat "$PLOG.config/acl.yaml" 2>/dev/null)"
+if plog_has "burp-chained sbx-code-" && grep -qE '^burp-chained sbx-code-[0-9]+-[0-9]+-proxy 127\.0\.0\.1:4321$' "$PLOG"; then
+  ok "-p: kanarisjekk mot Burp på hostens adresse"; else bad "-p: kanarisjekk mot Burp på hostens adresse" "$(grep '^burp-chained' "$PLOG")"; fi
+lc="$(grep -nE '^burp-chained ' "$PLOG" | cut -d: -f1)"; ls="$(grep -nE '^run --rm -i --name sbx-code-[0-9]+-[0-9]+ ' "$PLOG" | cut -d: -f1)"
+if [[ -n "$lc" && -n "$ls" ]] && (( lc < ls )); then
+  ok "-p: kanarisjekk før sandboxen"; else bad "-p: kanarisjekk før sandboxen" "kanari linje '${lc}', sandbox linje '${ls}'"; fi
+if grep -qE '^logs sbx-code-[0-9]+-[0-9]+-proxy$' "$PLOG" && grep -qE '^rm sbx-code-[0-9]+-[0-9]+-proxy$' "$PLOG"; then
+  ok "-p: Smokescreen ryddes, audit-logg lagres"; else bad "-p: Smokescreen ryddes, audit-logg lagres" "$(grep -E '^(logs|rm) ' "$PLOG")"; fi
 R="$(relay_run)"
 assert_match "-p: relay-bildet"                    ' harrbjorn/sbx-relay:latest ' "$R"
 assert_match "-p: relay på podman + internal"      '--network podman --network sbx-code-[0-9]+-[0-9]+-int ' "$R"
@@ -130,6 +155,29 @@ assert_match "-p: kollisjonsmelding"               'port 8000' "$MAIN_ERR"
 FAKE_TCP_PROBE_RC=1 run_main -p 127.0.0.1:4321 true
 assert_ne    "-p: fail-closed når proxyen ikke svarer" 0 "$MAIN_RC"
 if plog_has "network create"; then bad "-p: fail-closed: ingenting opprettet" "nett laget"; else ok "-p: fail-closed: ingenting opprettet"; fi
+
+run_main -p 127.0.0.1:4321 -a example.com true
+assert_no_match "-p: -a gir ingen «no effect»-advarsel" 'no effect' "$MAIN_ERR"
+assert_match    "-p: -a havner i allowlisten"         "'example\.com'" "$(cat "$PLOG.config/acl.yaml" 2>/dev/null)"
+run_main -p 127.0.0.1:4321 -a '*' true
+assert_match    "-p: -a '*' gir åpen utgang"          'action: open' "$(cat "$PLOG.config/acl.yaml" 2>/dev/null)"
+assert_match    "-p: åpen utgang varsles"             'warn: open egress' "$MAIN_ERR"
+run_main -p 127.0.0.1:4321 --no-default-allowlist -a example.com true
+assert_no_match "-p: --no-default-allowlist virker"   'anthropic|github|npmjs|pypi' "$(cat "$PLOG.config/acl.yaml" 2>/dev/null)"
+assert_no_match "-p: --no-default-allowlist uten advarsel" 'warn: --no-default-allowlist' "$MAIN_ERR"
+run_main -p localhost:4321 true
+assert_match    "-p localhost: kanari til localhost:4321" '^burp-chained [^ ]+ localhost:4321$' "$(grep '^burp-chained' "$PLOG")"
+
+SBX_UPSTREAM_PORT=4000 run_main -p 127.0.0.1:4321 true
+assert_match "-p: SBX_UPSTREAM_PORT velger porten"    ' -p 127\.0\.0\.1:4000:3128 ' "$(upstream_run)"
+SBX_UPSTREAM_PORT=0 run_main -p 127.0.0.1:4321 true
+assert_ne    "-p: ugyldig SBX_UPSTREAM_PORT avvises"  0 "$MAIN_RC"
+if plog_has "network create"; then bad "-p: ugyldig port: ingenting opprettet" "nett laget"; else ok "-p: ugyldig port: ingenting opprettet"; fi
+
+FAKE_BURP_CHAINED_RC=1 run_main -p 127.0.0.1:4321 true
+assert_ne    "-p: fail-closed når Burp ikke er kjedet" 0 "$MAIN_RC"
+assert_match "-p: meldingen peker på upstream-oppsettet" 'Upstream proxy servers.*127\.0\.0\.1:3129' "$MAIN_ERR"
+assert_eq    "-p: sandboxen kjøres ikke uten kjede"   "" "$(sandbox_run)"
 rm -f "$HH/claude.sh"
 
 # ------------------------------------- --no-default-allowlist (lokal modell)

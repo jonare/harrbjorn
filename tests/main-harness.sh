@@ -35,6 +35,8 @@ run_main() {
       source "$1/lib/sandbox.sh"
       sbx_usage() { exit "${1:-0}"; }
       sbx_tcp_probe() { return "${FAKE_TCP_PROBE_RC:-0}"; }
+      sbx_http_probe() { return 0; }
+      sbx_burp_chained() { echo "burp-chained $*" >> "$FAKE_PODMAN_LOG"; return "${FAKE_BURP_CHAINED_RC:-0}"; }
       shift; sbx_main "$@"
     ' _ "$HR" "$@" 2>&1 >"$T_TMP/main.out"
   )"

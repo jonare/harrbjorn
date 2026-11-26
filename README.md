@@ -36,7 +36,8 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
 **Det harrbjorn gir:**
 
 - **Nettverk:** ingen rå utgang. All trafikk går via proxyen (med `-p`:
-  relayen), allowlisten håndheves (åpen kun med `-a '*'`), og private,
+  relayen og den eksterne proxyen, som har harrbjorns proxy som upstream),
+  allowlisten håndheves (også med `-p`; åpen kun med `-a '*'`), og private,
   loopback-, link-local- og CGNAT-adresser avvises med mindre en IP-literal
   i allowlisten eller trusted-settet slipper dem. Hostens tjenester nås
   bare via trusted-portene (modellport, `-H`).
@@ -68,8 +69,12 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
   bare modell-API-et — f.eks. beskytter vLLMs `--api-key` bare `/v1`-rutene.
 - **Hosten via egne adresser.** En IP-literal i allowlisten for hostens LAN-
   eller offentlige adresse gjør hosten nåbar på de portene (link-local-
-  adressen 169.254.1.2 avvises). Med `-p` når den eksterne proxyen alt den
-  selv når — en Burp på hosten også hostens loopback-tjenester, LAN og VPN.
+  adressen 169.254.1.2 avvises).
+- **Upstream-reglene i den eksterne proxyen (`-p`).** harrbjorn stoler på at
+  den eksterne proxyen sender *alt* videre til harrbjorns proxy.
+  Kanarisjekken ved oppstart fanger en proxy som ikke er kjedet, men ikke
+  upstream-regler som bare dekker noen verter: de andre når Burp direkte,
+  også hostens loopback-tjenester, LAN og VPN.
 - **Prosjektconfig i `/work`.** Claude Code kjører med `bypassPermissions`
   og `/work` er forhåndsgodkjent: hooks og MCP-config i prosjektets
   `.claude/settings.json` kjøres i sandboxen uten spørsmål, og følger
@@ -84,7 +89,8 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
 - **Proxyen og relayen er ett punkt.** Kompromitteres Smokescreen eller
   socat-relayen, har angriperen reell utgang. De henger også på podmans
   standardnett og lytter på alle grensesnitt, så andre containere der kan
-  bruke dem.
+  bruke dem. Med `-p` er proxyen i tillegg publisert på hostens
+  `127.0.0.1`, så alle prosesser på hosten kan bruke den.
 - **Forsyningskjeden.** Basebildene og Claude Code-/pi-versjonene er
   pinnet, men transitive npm-avhengigheter og apt-pakker flyter og
   installeres med lifecycle-scripts. Byggene kjører med podmans vanlige
@@ -169,14 +175,19 @@ avbrutte kjør ryddes ved neste oppstart. En proxy eller relay som fortsatt
 kjører fordi wrapperen ble drept med SIGKILL, ryddes ikke automatisk (se
 [Fjerne](#fjerne-hvis-du-sletter-oppsettet-helt)).
 
-Variante — ekstern proxy (`-p`): sesjonsnettet er fortsatt `--internal`,
-men i stedet for harrbjorns proxy starter en per-sesjon relay
-(`sbx-<S>-relay`) som kun videresender til den eksterne proxyen,
-modellporten og `-H`-portene (se [Ekstern proxy](#ekstern-proxy--p)).
+Variant — ekstern proxy (`-p`): sesjonsnettet er fortsatt `--internal`.
+En per-sesjon relay (`sbx-<S>-relay`) videresender kun til den eksterne
+proxyen, modellporten og `-H`-portene, og harrbjorns proxy er den eksterne
+proxyens upstream: publisert på `127.0.0.1:3129`, kun på pasta-nettet, ikke
+på sesjonsnettet (se [Ekstern proxy](#ekstern-proxy--p)):
+
+```
+sandbox ─ int ─ relay ─ Burp (host) ─ 127.0.0.1:3129 ─ sbx-<S>-proxy ─ mål
+```
 
 Isolasjonslag — uavhengige der det er mulig. Lag 2 og 3 er samme
-komponent (Smokescreen), og proxyen (med `-p`: relayen) er ett punkt for
-utgangspolicyen; under krun gjelder lag 4 for VMM-prosessen, ikke i gjesten:
+komponent (Smokescreen), og proxyen er ett punkt for utgangspolicyen (med
+`-p` i tillegg relayen og den eksterne proxyen); under krun gjelder lag 4 for VMM-prosessen, ikke i gjesten:
 
 1. **Per-sesjon internal-nettverk** (rootless netavark) — kjernepolitikk:
    agenten kan fysisk ikke åpne en rå socket til internett. Nettverket lever
@@ -196,7 +207,8 @@ utgangspolicyen; under krun gjelder lag 4 for VMM-prosessen, ikke i gjesten:
    avvises av IP-filteret, både som navn og som IP-literal i allowlisten.
    Hostens tjenester nås via trusted-settet (modellport + `-H`), se
    [Host-tjenester](#host-tjenester). Unntak: hostens LAN- eller offentlige
-   adresse som IP-literal, og med `-p` det den eksterne proxyen når.
+   adresse som IP-literal, og med `-p` det den eksterne proxyen når uten å
+   gå via harrbjorns proxy (upstream-regler som ikke dekker alt).
 4. **Container-hardening** — `--read-only`, `--cap-drop ALL`,
    `--security-opt no-new-privileges`, keep-id user-namespace (hostbrukeren
    blir uid 1000 i containeren, så bindmounter eies av hostbrukeren utenfor),
@@ -285,8 +297,8 @@ Flagg (identiske i begge):
 | `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). `-a '*'` gir åpen utgang; IP-literaler gjelder også i åpen modus (unntak fra IP-filteret). |
 | `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream — se [Host-tjenester](#host-tjenester). |
 | `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten; en linje `*` gir åpen utgang). |
-| `-p host:port` | Ekstern forward-proxy som utgang (f.eks. Burp Suite; den må lytte utover loopback, se [Host-tjenester](#host-tjenester)). Harrbjorns egen proxy startes ikke; nettet er fortsatt `--internal`, og en relay videresender kun til proxyen, modellporten og `-H`-portene. Fail-closed — se [Ekstern proxy](#ekstern-proxy--p). |
-| `--no-default-allowlist` | Allowlist-modus uten default-allowlisten: kun `-a`/`-f` og den trusted modellporten. Profil for lokal modell (LLM-API-, GitHub- og pakkeregister-hostene er exfil-kanaler). Uten virkning med `-a '*'` eller `-p`. |
+| `-p host:port` | Ekstern forward-proxy (f.eks. Burp Suite; den må lytte utover loopback, se [Host-tjenester](#host-tjenester)) med harrbjorns proxy som upstream på `127.0.0.1:3129` — allowlisten gjelder. Nettet er fortsatt `--internal`, og en relay videresender kun til proxyen, modellporten og `-H`-portene. Fail-closed — se [Ekstern proxy](#ekstern-proxy--p). |
+| `--no-default-allowlist` | Allowlist-modus uten default-allowlisten: kun `-a`/`-f` og den trusted modellporten. Profil for lokal modell (LLM-API-, GitHub- og pakkeregister-hostene er exfil-kanaler). Uten virkning med `-a '*'`. |
 | `--git-rw` | Monter workdirens `.git` skrivbar. Default: en eksisterende `.git`-katalog øverst i workdir monteres read-only — se [Trusselmodell](#trusselmodell) for hva det ikke dekker. Wrapperen advarer. |
 | `--ca-cert FILE` | Ekstra CA-sertifikat (PEM/DER, kan gjentas) å stole på i bildebyggene og i sandboxen, f.eks. roten til en TLS-inspiserende mellomboks. Se [Ekstra CA](#ekstra-ca---ca-cert). |
 | `--resume[=ID]` | Gjenbruk HOME-en til sist brukte økt (eller økt `ID`) i samme workdir og usecase, som den var. Uten flagget får økten en ny, tom HOME. Se [Økter](#økter-og-resume). |
@@ -305,6 +317,7 @@ Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
 | `SBX_CLAUDE_CONFIG` | sti | Modelconfig (default `~/claude.sh`). |
 | `SBX_RUNTIME` | `krun` | OCI-runtime for sandbox (og proxy): `krun` (microVM via KVM, default) / `runsc` (gVisor) / `crun` (eksplisitt — aldri stille fallback). Wrapperen feiler ved oppstart hvis valgt runtime (resp. `/dev/kvm` for krun) mangler. |
 | `SBX_CA_CERTS` | — | Kolonseparerte CA-filer, som `--ca-cert` (praktisk i `.env` når nettet alltid krever det). |
+| `SBX_UPSTREAM_PORT` | `3129` | Porten harrbjorns proxy publiseres på (`127.0.0.1`) som den eksterne proxyens upstream med `-p`. Fast, så upstream-oppsettet i Burp kan stå; én `-p`-sesjon om gangen per port. |
 | `SBX_KEEP_SESSIONS` | `10` | Antall økt-HOME-er som beholdes per workdir + usecase (sist brukte); eldre slettes ved oppstart av en ny. En økt i bruk slettes aldri. |
 
 Proxyen startes per sesjon — wrapperen viser navnet
@@ -345,7 +358,7 @@ harrbjorn security -w ~/pentest -a 192.168.50.10:8080 curl -sI http://192.168.50
 harrbjorn security -w ~/pentest -a 192.168.50.10:8080 sh -c \
   'sqlmap --proxy "$HTTP_PROXY" -u "http://192.168.50.10:8080/admin" --batch'
 
-# Via ekstern proxy (Burp): firewall-logikken i Burp, ikke i harrbjorn
+# Via ekstern proxy (Burp med harrbjorns proxy som upstream): allowlisten gjelder
 harrbjorn security -p 127.0.0.1:4321 claude -p "Test målet via Burp"
 ```
 
@@ -437,8 +450,18 @@ curl --max-time 5 http://host.containers.internal:22/ # 502 (link-local, aldri i
 ## Ekstern proxy (`-p`)
 
 `-p host:port` sender containerens utgang gjennom en ekstern
-forward-proxy (f.eks. Burp Suite på `127.0.0.1:4321`) i stedet for
-harrbjorns egen proxy:
+forward-proxy (f.eks. Burp Suite på `127.0.0.1:4321`), med harrbjorns egen
+proxy som dens upstream:
+
+```
+sandbox ─ int ─ relay ─ Burp (host) ─ 127.0.0.1:3129 ─ sbx-<S>-proxy ─ mål
+```
+
+Oppsett i Burp (én gang): Settings > Network > Connections > Upstream
+proxy servers: destination host `*`, proxy `127.0.0.1`, port `3129`
+(`SBX_UPSTREAM_PORT`). Regelen gjelder all trafikk Burp sender — også din
+egen nettleser via Burp — og den feiler når ingen `-p`-sesjon kjører; bruk
+gjerne et eget Burp-prosjekt for agentøkter.
 
 - **Sesjonsnettet er fortsatt `--internal`.** Proxy-env-vars er bare et
   hint en fiendtlig agent kan ignorere, så «ingen rå utgang» kan ikke
@@ -446,18 +469,21 @@ harrbjorns egen proxy:
   read-only, uid 65534 — root i gjesten under krun, se lag 5) på internal-nettet + pasta-nettet er sandboxens
   eneste vei ut, og videresender kun faste porter: den eksterne proxyen,
   modellporten og `-H`-portene. Agenten når ingenting annet direkte —
-  verken internett, LAN eller andre host-porter. Gjennom den eksterne
-  proxyen når den derimot alt proxyen når: en Burp på hosten også hostens
-  loopback-tjenester, LAN og VPN.
-- **Hva som slipper gjennom proxyen er proxyens jobb** — harrbjorns egen
-  proxy (Smokescreen) startes ikke: ingen allowlist, ingen harrbjorn-
-  audit-logg (proxyens egen logging er trafikk-loggen; trafikk til
-  modellporten og `-H`-portene går direkte gjennom relayen og logges ikke). `-a` og `-f` har
-  ingen effekt (wrapperen advarer). Merk: Burp-scope dropper ikke
-  out-of-scope-trafikk med standardinnstillinger.
+  verken internett, LAN eller andre host-porter.
+- **Allowlisten gjelder** — Burp sender videre til harrbjorns proxy, som
+  slår opp og kobler til målet selv: ACL, IP-filter og audit-logg gjelder
+  som uten `-p` (`-a`, `-f`, `-a '*'`, `--no-default-allowlist`), og Burps
+  egne DNS-oppslag spiller ingen rolle. Proxyen er publisert kun på
+  hostens `127.0.0.1` (ikke LAN) og sitter ikke på sesjonsnettet, så
+  sandboxen når den bare gjennom Burp. Trafikk til modellporten og
+  `-H`-portene går direkte gjennom relayen og logges ikke.
 - **Fail-closed** — før noe sesjonsressurs lages, TCP-prober wrapperen
   `host:port` fra hosten (timeout 5 s). Svarer ingenting: hard feil,
-  sesjonen startes ikke — ingen fallback.
+  sesjonen startes ikke — ingen fallback. Før sandboxen startes sender
+  wrapperen en forespørsel til et tilfeldig kanarinavn gjennom den
+  eksterne proxyen fra hosten; dukker den ikke opp i harrbjorns proxy-logg
+  (Burp er ikke kjedet), avbrytes sesjonen. Kanarien fanger ikke
+  upstream-regler som bare dekker noen verter.
 - **Host-tjenester via relayen** — i sandboxen peker
   `host.containers.internal` på relayen (`--add-host`) og står i
   `NO_PROXY`, så modellserveren og `-H`-tjenester nås på samme URL som
@@ -477,7 +503,7 @@ harrbjorns egen proxy:
   relayen når (ikke bare `127.0.0.1`), se [Host-tjenester](#host-tjenester).
 
 ```bash
-# Burp lytter på *:4321 (targets godkjennes i Burp selv):
+# Burp lytter på *:4321, upstream 127.0.0.1:3129 (målene i allowlisten med -a):
 harrbjorn code -p 127.0.0.1:4321 claude -p "Test via Burp"
 harrbjorn security -p 127.0.0.1:4321 claude -p "Test målet via Burp"
 ```
@@ -658,11 +684,16 @@ SBX_RUNTIME=runsc ./run-code.sh -w /tmp/sbx-test -- sh -c 'true' 2>&1 \
 ./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:9 -- sh -c 'true' 2>&1 \
   | grep -F 'error: -p: no forward proxy answering'   # → match (exit 1)
 
-# -p: working path (Burp lytter på *:4321)
-./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:4321 -- sh -c '
+# -p: Burp uten upstream-regel → kanarien kommer aldri fram (exit 1)
+./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:4321 -- true 2>&1 \
+  | grep -F 'canary never arrived'                       # → match
+
+# -p: working path (Burp lytter på *:4321, upstream 127.0.0.1:3129)
+./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:4321 -a example.com -- sh -c '
   echo "$HTTP_PROXY"                     # → http://sbx-<S>-relay:4321
   ls -l ~/.sbx-ca-bundle.pem 2>/dev/null # → 0600, system-CAs + Burp CA
-  curl -sI https://example.com | head -1 # → OK (TLS via Burp CA)
+  curl -sI https://example.com | head -1 # → OK (TLS via Burp CA; -a)
+  curl -sI https://example.org | head -1 # → avvist av harrbjorns proxy
 '
 ```
 
@@ -701,8 +732,9 @@ mkdir -p /tmp/sbx-a
   garant.
 - Utgang er **proxy-kun**, ikke «proxy-fremst»: rå TCP uten proxy
   feiler trygt (ingen route), også med `-p` (relayen videresender kun
-  faste porter). Med `-p` er den eksterne proxyens logging den eneste
-  trafikk-loggen (harrbjorn-audit-loggen gjelder ikke). Audit-loggen
+  faste porter). Med `-p` gjelder audit-loggen også (harrbjorns proxy er
+  Burps upstream), unntatt trafikken til modellporten og `-H`-portene,
+  som går direkte gjennom relayen. Audit-loggen
   registrerer beslutninger (mål, tillatt/avvist, grunn), ikke innhold.
 - Åpen utgang (`-a '*'`) er et bevisst valg per økt: alle beslutninger
   logges fortsatt, og IP-filteret (loopback, link-local, private, CGNAT),

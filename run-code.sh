@@ -20,19 +20,22 @@
 #   all trafikk, men slipper alle offentlige mål. Bevisst per økt; ikke
 #   via env (SBX_OPEN_NETWORK ignoreres). Siter '*' mot shell-globbing.
 #
-#   Ekstern proxy: -p 127.0.0.1:4321 bruker en ekstern forward-proxy
-#   (f.eks. Burp Suite) som utgang — harrbjorns proxy startes ikke, og
-#   allowlisten gjelder ikke. Nettet er fortsatt --internal: en relay
-#   videresender kun til proxyen, modellporten og -H-portene (agenten når
-#   ingenting annet direkte, men proxyen når det den når — en Burp på hosten
-#   også hostens loopback). Proxyen må lytte utover loopback. Fail-closed: svarer ingenting på porten,
-#   avsluttes sesjonen (ingen fallback). Burp-CA auto-installas dersom
-#   proxyen detekteres. host.containers.internal peker på relayen.
+#   Ekstern proxy: -p 127.0.0.1:4321 sender trafikken gjennom en ekstern
+#   forward-proxy (f.eks. Burp Suite), og allowlisten gjelder fortsatt:
+#   harrbjorns proxy er den eksterne proxyens upstream, publisert på
+#   127.0.0.1:3129 (SBX_UPSTREAM_PORT). I Burp: Settings > Network >
+#   Connections > Upstream proxy servers: destination host *, proxy
+#   127.0.0.1:3129. Nettet er fortsatt --internal: en relay videresender
+#   kun til proxyen, modellporten og -H-portene. Proxyen må lytte utover
+#   loopback. Fail-closed: svarer ingenting på porten, eller sender ikke
+#   proxyen videre til harrbjorns proxy (kanarisjekk), startes ikke
+#   sesjonen. Burp-CA auto-installas dersom proxyen detekteres.
+#   host.containers.internal peker på relayen.
 #
 #   --no-default-allowlist: allowlist-modus uten default-allowlisten —
 #   kun -a/-f og den trusted modellporten (profil for lokal modell; LLM-API-,
 #   GitHub- og pakkeregister-hostene er exfil-kanaler). Uten virkning
-#   sammen med -a '*' eller -p.
+#   sammen med -a '*'.
 #
 #   Workspace: workdir mountes rw på /work — hosten kjører senere det
 #   agenten legger der (Makefile, scripts, .envrc). En eksisterende
@@ -84,7 +87,7 @@
 #
 # Isolasjonslag (rootless podman, ingen sudo; se README for hva de ikke dekker):
 #   1. sandbox kjører kun på sesjonens internal-nett (ingen direkte utgang)
-#   2. forward-proxy er eneste utgang; allowlist håndheves, audit-logg (uten -p)
+#   2. forward-proxy er eneste utgang; allowlist håndheves, audit-logg (også med -p)
 #   3. container-hardening: read-only, cap-drop ALL, no-new-privileges, limits
 #   4. microVM via krun (eget kernel — KVM; SBX_RUNTIME)
 #   5. keep-id user-namespace, per-sesjon proxy + nett, automatisk opprydding
