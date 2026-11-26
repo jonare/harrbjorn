@@ -1602,9 +1602,10 @@ sbx_main() {
   #    per-session upperdir: the host's workdir (and .git) is never written
   #    or relabeled during the session; the changes come out as a patch
   #    afterwards (sbx_overlay_finish).
-  #  ro / none — the workdir read-only at /work, or not mounted at all; the
-  #    agent's way out is a writable /out per session (.sandbox/out/<S>,
-  #    shown afterwards by sbx_out_finish).
+  #  ro / none — the workdir read-only at /work, or not mounted at all (an
+  #    empty read-only tmpfs instead: podman refuses `-w /work` with nothing
+  #    mounted there); the agent's way out is a writable /out per session
+  #    (.sandbox/out/<S>, shown afterwards by sbx_out_finish).
   #  rw — the workdir is rw, but its .git is mounted read-only on top: git
   #    config (core.fsmonitor, core.hooksPath, ...) and hooks written by the
   #    agent would run on the HOST at the next git command there — many
@@ -1625,8 +1626,11 @@ sbx_main() {
       OUT_DIR="$STATE_DIR/out/$S"
       mkdir -p "$OUT_DIR"
       chmod 0700 "$OUT_DIR"
-      MOUNTS=(-v "$OUT_DIR:/out:z")
-      [[ "$WORK" == ro ]] && MOUNTS=(-v "$WORKDIR_ABS:/work:ro,z" "${MOUNTS[@]}")
+      if [[ "$WORK" == ro ]]; then
+        MOUNTS=(-v "$WORKDIR_ABS:/work:ro,z" -v "$OUT_DIR:/out:z")
+      else
+        MOUNTS=(--tmpfs /work:ro,size=1m,mode=0555 -v "$OUT_DIR:/out:z")
+      fi
       ;;
     rw|rw+git)
       MOUNTS=(-v "$WORKDIR_ABS:/work:z")

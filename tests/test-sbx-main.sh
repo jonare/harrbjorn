@@ -96,6 +96,9 @@ FAKE_PODMAN_OUT_FILE=result.txt run_main --work none true
 SR="$(sandbox_run)"
 assert_eq       "work none: exit 0"                 0 "$MAIN_RC"
 assert_no_match "work none: workdir ikke montert"   ':/work' "$SR"
+# podman avviser -w /work når ingenting er montert der (stat mot rootfs),
+# så /work blir en tom, read-only tmpfs.
+assert_match    "work none: tom read-only /work"    ' --tmpfs /work:ro,size=1m,mode=0555 ' "$SR"
 assert_match    "work none: arbeidskatalog /work"   ' -w /work ' "$SR"
 assert_match    "work none: skrivbar /out per økt"  "-v $OUTD:/out:z " "$SR"
 assert_match    "work none: /out vises etterpå"     "out: .*$OUTD" "$MAIN_ERR"
@@ -119,8 +122,8 @@ done
 # ------------------------------------------- -p beholder --internal
 # Med ekstern proxy (Burp) forblir sesjonsnettet --internal: en relay
 # (socat) på internal + podman-nettet videresender KUN faste porter — den
-# eksterne proxyen, modellporten og -H-portene. I sandboxen peker
-# host.containers.internal på relayen, så modell-URL-er og -H-URL-er virker
+# eksterne proxyen, modellporten og hostportene (--net host:PORT). I sandboxen peker
+# host.containers.internal på relayen, så modell-URL-er og host:PORT-URL-er virker
 # uendret, og agenten når ingenting annet direkte.
 #
 # Allowlisten gjelder også med -p: harrbjorns Smokescreen er Burps
@@ -162,7 +165,7 @@ for f in '--read-only' '--cap-drop ALL' '--security-opt no-new-privileges' '--us
 done
 assert_match "-p: relay -> Burp"                   ' 4321:host\.containers\.internal:4321( |$)' "$R"
 assert_match "-p: relay -> modellport"             ' 8000:host\.containers\.internal:8000( |$)' "$R"
-assert_match "-p: relay -> -H-port"                ' 9443:host\.containers\.internal:9443( |$)' "$R"
+assert_match "-p: relay -> hostport"               ' 9443:host\.containers\.internal:9443( |$)' "$R"
 assert_no_match "-p: ingen andre porter"           ' [0-9]+:[^ ]+:(22|80|443)( |$)' "$R"
 SR="$(sandbox_run)"
 assert_match "-p: HTTP_PROXY -> relay"             '-e HTTP_PROXY=http://sbx-code-[0-9]+-[0-9]+-relay:4321 ' "$SR"
