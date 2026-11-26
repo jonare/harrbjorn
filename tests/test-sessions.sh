@@ -3,7 +3,9 @@
 # egen HOME under nøkkelen for usecase + workdir; resume er et eksplisitt
 # valg. Metadata ligger på hosten utenfor det som monteres (<base>/.index i
 # sist-brukt-rekkefølge, <base>/.<ID>.lock mens en kjøring bruker økta),
-# så agenten kan ikke påvirke hvilken økt --resume velger.
+# så agenten kan ikke påvirke hvilken økt --resume velger. Ved siden av ligger
+# <base>/.<ID>.caps: capabilities HOME-en har hatt (unionen over øktene som
+# brukte den), så en --resume som utvider dem kan varsles.
 # Kjør: bash tests/test-sessions.sh
 set -uo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -68,5 +70,46 @@ assert_eq "metadata: lenkemål urørt"           precious "$(cat "$T_TMP/victim"
 printf 'code-1-1 100\n$(id) junk\n' > "$B2/.index"
 sbx_session_touch "$B2" code-1-1 200
 assert_no_match "metadata: ugyldige linjer forkastes ved touch" 'junk' "$(cat "$B2/.index")"
+
+# ------------------------------------------------------- capabilities
+caps() { sbx_caps_lines "$@" | tr '\n' '|'; }
+assert_eq "caps: linjer"  "host 8000|host 9443|net example.com|net registry.npmjs.org|work overlay|" \
+  "$(caps overlay 0 host.containers.internal:8000,host.containers.internal:9443 registry.npmjs.org example.com)"
+assert_eq "caps: @all"    "open|work rw|" "$(caps rw 1 "")"
+
+C="$T_TMP/caps"; mkdir -p "$C/code-1-1"
+assert_fails "caps: ingen fil ved første gangs lasting"  sbx_session_caps_load "$C" code-1-1
+sbx_session_caps_save "$C" code-1-1 "$(sbx_caps_lines overlay 0 "" a.example)"
+assert_eq "caps: lagret og lastet" "net a.example|work overlay|" "$(sbx_session_caps_load "$C" code-1-1 | tr '\n' '|')"
+sbx_session_caps_save "$C" code-1-1 "$(sbx_caps_lines rw 0 "" b.example)"
+assert_eq "caps: lagring er union" "net a.example|net b.example|work overlay|work rw|" "$(sbx_session_caps_load "$C" code-1-1 | tr '\n' '|')"
+printf 'work overlay\n$(id) junk\nwork bogus\n' > "$C/.code-1-1.caps"
+assert_eq "caps: ugyldige linjer forkastes" "work overlay|" "$(sbx_session_caps_load "$C" code-1-1 | tr '\n' '|')"
+echo precious > "$T_TMP/victim2"; rm -f "$C/.code-1-1.caps"; ln -s "$T_TMP/victim2" "$C/.code-1-1.caps"
+sbx_session_caps_save "$C" code-1-1 "work ro"
+assert_eq "caps: lagring følger ikke symlenke" precious "$(cat "$T_TMP/victim2")"
+
+# widened OLD-ARGS... -- NEW-ARGS... (argumentene til sbx_caps_lines)
+widened() {
+  local o=(); while [[ "$1" != -- ]]; do o+=("$1"); shift; done; shift
+  sbx_caps_widened "$(sbx_caps_lines "${o[@]}")" "$(sbx_caps_lines "$@")" | tr '\n' ' '
+}
+assert_eq "utvidet: like caps"                  "" "$(widened overlay 0 "" -- overlay 0 "")"
+assert_eq "utvidet: smalere work"               "" "$(widened rw 0 "" -- ro 0 "")"
+assert_eq "utvidet: none < ro < overlay"        "work overlay " "$(widened ro 0 "" -- overlay 0 "")"
+assert_eq "utvidet: rw etter overlay"           "work rw " "$(widened overlay 0 "" -- rw 0 "")"
+assert_eq "utvidet: rw+git etter rw"            "work rw+git " "$(widened rw 0 "" -- rw+git 0 "")"
+assert_eq "utvidet: @all"                       "@all " "$(widened overlay 0 "" -- overlay 1 "")"
+assert_eq "utvidet: ny hostport"                "host:9443 " "$(widened overlay 0 host.containers.internal:8000 -- overlay 0 host.containers.internal:8000,host.containers.internal:9443)"
+assert_eq "utvidet: ny post"                    "b.example " "$(widened overlay 0 "" a.example -- overlay 0 "" a.example b.example)"
+assert_eq "utvidet: navn etter @all er dekket"  "" "$(widened overlay 1 "" -- overlay 0 "" github.com)"
+assert_eq "utvidet: IP-literal etter @all er ny (private stengt i åpen modus)" "10.0.0.5:8080 [fd00::1]:443 " \
+  "$(widened overlay 1 "" -- overlay 0 "" 10.0.0.5:8080 '[fd00::1]:443')"
+
+# Opprydding fjerner også caps-fila.
+mk code-700-7 700; mk code-800-8 800
+sbx_session_caps_save "$B" code-700-7 "work ro"
+sbx_session_prune "$B" 1 2>/dev/null
+if [[ -e "$B/.code-700-7.caps" ]]; then bad "prune: caps-fila fjernes" "finnes"; else ok "prune: caps-fila fjernes"; fi
 
 t_summary

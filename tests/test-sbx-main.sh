@@ -351,6 +351,31 @@ run_main --resume true
 assert_ne       "økter: --resume uten økter avvises"  0 "$MAIN_RC"
 assert_match    "økter: melding uten økter"           'no session to resume' "$MAIN_ERR"
 
+# Capabilities per økt: hostside (<base>/.<ID>.caps, aldri montert) og
+# union over øktene som har brukt HOME-en. En --resume som gir HOME-en mer
+# enn den har hatt (f.eks. en HOME fra --net @all gjenopptatt med --work
+# rw), gir en advarsel som lister utvidelsene.
+rm -rf "$HBASE"
+run_main true; H1="$(home_of)"; ID1="$(basename "$H1")"
+CAPS="$(dirname "$H1")/.$ID1.caps"
+assert_eq       "caps: ny økt lagrer work"            "work overlay" "$(grep -x 'work overlay' "$CAPS" 2>/dev/null)"
+assert_eq       "caps: ny økt lagrer nett"            "net api.anthropic.com" "$(grep -x 'net api\.anthropic\.com' "$CAPS" 2>/dev/null)"
+run_main --resume true
+assert_no_match "caps: resume med samme caps: ingen advarsel" 'capabilities' "$MAIN_ERR"
+run_main --resume --work rw --net @all,host:9443 true
+assert_match    "caps: utvidet resume advarer"        "warn: --resume: session $ID1 gets capabilities its HOME has not had" "$MAIN_ERR"
+assert_match    "caps: advarselen lister work"        'capabilities .*work rw' "$MAIN_ERR"
+assert_match    "caps: advarselen lister @all"        'capabilities .*@all' "$MAIN_ERR"
+assert_match    "caps: advarselen lister hostporten"  'capabilities .*host:9443' "$MAIN_ERR"
+assert_eq       "caps: resume kjøres likevel"         0 "$MAIN_RC"
+run_main --resume --work rw true
+assert_no_match "caps: unionen er lagret"             'capabilities' "$MAIN_ERR"
+rm -f "$CAPS"
+run_main --resume true
+assert_match    "caps: økt uten caps-fil advarer"     "warn: --resume: session $ID1 has no recorded capabilities" "$MAIN_ERR"
+assert_eq       "caps: caps-fila lages da"            "work overlay" "$(grep -x 'work overlay' "$CAPS" 2>/dev/null)"
+rm -rf "$HBASE"
+
 for _ in 1 2 3; do SBX_KEEP_SESSIONS=2 run_main true; done
 assert_eq       "økter: SBX_KEEP_SESSIONS beholder de nyeste" 2 "$(find "$HBASE"/proj-* -mindepth 1 -maxdepth 1 -type d | wc -l)"
 assert_match    "økter: nyeste beholdt"               "$(basename "$(home_of)")" "$(ls "$HBASE"/proj-*)"

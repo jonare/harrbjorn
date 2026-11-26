@@ -258,8 +258,9 @@ sbx_check_agent_home() {
 # session starts from the image alone, untouched by earlier ones, and
 # --resume reuses one explicitly. Host-side metadata next to the HOMEs —
 # <base> itself is never mounted, so the agent cannot touch it:
-# <base>/.index ("ID EPOCH" lines, most recently used last) and
-# <base>/.<ID>.lock (flock held by the run that uses the session).
+# <base>/.index ("ID EPOCH" lines, most recently used last),
+# <base>/.<ID>.lock (flock held by the run that uses the session) and
+# <base>/.<ID>.caps (the capabilities the HOME has had, see below).
 # The metadata never writes through a link: locks are opened for append
 # (no truncation, nothing written), the index is replaced via a fresh
 # mktemp file + rename, and only well-formed index lines survive.
@@ -347,9 +348,83 @@ sbx_session_prune() {
         || { chmod -R u+rwX -- "$base/$id" 2>/dev/null; rm -rf -- "${base:?}/$id" 2>/dev/null; } \
         || ${PODMAN:-podman} unshare rm -rf -- "$base/$id" \
         || echo "warn: sessions: could not remove $base/$id" >&2
-      [[ -e "$base/$id" ]] || { sbx_session_forget "$base" "$id"; rm -f "$base/.$id.lock"; }
+      [[ -e "$base/$id" ]] || { sbx_session_forget "$base" "$id"; rm -f "$base/.$id.lock" "$base/.$id.caps"; }
     } 9>>"$base/.$id.lock"
   done
+}
+
+# ------------------------------------------- session capabilities (.caps)
+# A HOME carries whatever its sessions left in it — also what a target
+# planted (prompt injection, hooks, tools). <base>/.<ID>.caps records the
+# union of the capabilities the HOME has had, one per line:
+#   work MODE     --work mode
+#   open          --net @all
+#   host PORT     trusted host port (model server, host:PORT)
+#   net ENTRY     allowlist entry (--net, model endpoint)
+# A --resume that gives the HOME more than that is warned about
+# (sbx_caps_widened), not refused. Written like the index: a fresh mktemp
+# file renamed into place, never through a link; only well-formed lines
+# are read back.
+SBX_CAPS_LINE_RE='^(work (none|ro|overlay|rw|rw\+git)|open|host [0-9]{1,5}|net [^[:space:]]+)$'
+
+# sbx_caps_lines WORK OPEN TRUSTED_CSV [ENTRY...] — the session's
+# capabilities as sorted .caps lines.
+sbx_caps_lines() {
+  local work="$1" open="$2" trusted="$3" t e; shift 3
+  {
+    echo "work $work"
+    if (( open )); then echo open; fi
+    IFS=',' read -r -a t <<< "$trusted"
+    for e in ${t[@]+"${t[@]}"}; do [[ -n "$e" ]] && echo "host ${e##*:}"; done
+    for e in "$@"; do echo "net $e"; done
+  } | LC_ALL=C sort -u
+}
+
+# sbx_session_caps_load BASE ID — print the recorded capabilities; fails
+# when the session has none recorded.
+sbx_session_caps_load() {
+  [[ -f "$1/.$2.caps" && ! -L "$1/.$2.caps" ]] || return 1
+  grep -E "$SBX_CAPS_LINE_RE" "$1/.$2.caps" || true
+}
+
+# sbx_session_caps_save BASE ID LINES — record LINES in union with what is
+# recorded already.
+sbx_session_caps_save() {
+  local base="$1" id="$2" tmp
+  tmp="$(mktemp "$base/.$id.caps.XXXXXX")" || return 1
+  { sbx_session_caps_load "$base" "$id" || true; printf '%s\n' "$3"; } \
+    | grep -E "$SBX_CAPS_LINE_RE" | LC_ALL=C sort -u > "$tmp"
+  mv -f "$tmp" "$base/.$id.caps"
+}
+
+# sbx_caps_widened OLD NEW — print what NEW (.caps lines) adds to OLD, one
+# per line: a --work mode above every recorded one (none < ro < overlay <
+# rw < rw+git), @all, host:PORT and entries not recorded. After @all a name
+# is already covered; an IP literal is not (private addresses stay closed
+# in open mode, and public ones are not told apart here).
+_sbx_work_rank() { case "$1" in none) echo 0 ;; ro) echo 1 ;; overlay) echo 2 ;; rw) echo 3 ;; rw+git) echo 4 ;; esac; }
+sbx_caps_widened() {
+  local old="$1" new="$2" line e max=-1 r
+  while IFS= read -r line; do
+    [[ "$line" == "work "* ]] || continue
+    r="$(_sbx_work_rank "${line#work }")"; (( r > max )) && max="$r"
+  done <<< "$old"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    grep -qxF -- "$line" <<< "$old" && continue
+    case "$line" in
+      "work "*) (( $(_sbx_work_rank "${line#work }") > max )) && echo "$line" ;;
+      open) echo "@all" ;;
+      "host "*) echo "host:${line#host }" ;;
+      "net "*)
+        e="${line#net }"
+        if grep -qxF open <<< "$old" && [[ ! "$e" =~ ^\[ && ! "$e" =~ ^[0-9.]+(:[0-9]+)?$ && "$e" != *:*:* ]]; then
+          continue
+        fi
+        echo "$e" ;;
+    esac
+  done <<< "$new"
+  return 0
 }
 
 # Print the host's upstream DNS servers, one per line, in system order.
@@ -1327,6 +1402,24 @@ sbx_main() {
   done
   if (( ${#HOST_PORTS[@]} )); then echo ">> host ports: ${HOST_PORTS[*]} (via host.containers.internal)"; fi
 
+  # ------------------------------------------------- capabilities (session)
+  # What this session gets, recorded with its HOME (sbx_session_caps_save,
+  # below). Resuming a HOME with more than it has had is allowed, with a
+  # warning before anything starts: whatever an earlier session planted in
+  # it gets the new capabilities too.
+  local CAPS old_caps widened
+  CAPS="$(sbx_caps_lines "$WORK" "$OPEN_EGRESS" "$PROXY_TRUSTED" ${NET_ENTRIES[@]+"${NET_ENTRIES[@]}"})"
+  if (( RESUME )); then
+    if old_caps="$(sbx_session_caps_load "$SESSION_BASE" "$SESSION_ID")"; then
+      widened="$(sbx_caps_widened "$old_caps" "$CAPS")"
+      if [[ -n "$widened" ]]; then
+        echo "warn: --resume: session $SESSION_ID gets capabilities its HOME has not had: $(printf '%s' "$widened" | tr '\n' ',' | sed 's/,/, /g'). What earlier sessions left in it (prompt injection, hooks, tools) gets them too." >&2
+      fi
+    else
+      echo "warn: --resume: session $SESSION_ID has no recorded capabilities (older than the record); it may have had any." >&2
+    fi
+  fi
+
   # ------------------------------------------------------- relay specs (-p)
   # The external proxy plus every trusted host port (model server, host:PORT).
   # In the sandbox host.containers.internal resolves to the relay, so each
@@ -1461,6 +1554,7 @@ sbx_main() {
   sbx_check_agent_home "$STATE_DIR" "$AGENT_HOME" || exit 1
   chmod 0700 "$AGENT_HOME"
   sbx_session_touch "$SESSION_BASE" "$SESSION_ID"
+  sbx_session_caps_save "$SESSION_BASE" "$SESSION_ID" "$CAPS"
   sbx_session_prune "$SESSION_BASE" "$SBX_KEEP_SESSIONS"
   if (( RESUME )); then echo ">> session: $SESSION_ID (resumed)"; else echo ">> session: $SESSION_ID (new)"; fi
 

@@ -564,6 +564,15 @@ harrbjorn code --resume=code-1795694761-1318814 pi -r
 - Resume tar med alt økta hadde, også det et mål eventuelt plantet
   (prompt injection i samtalen, hooks, verktøy). Det er det eksplisitte
   valget; en ny økt er ren.
+- Capabilities arves ikke: hver kjøring får dem fra sin egen kommandolinje
+  (`--net`, `--work`). Hva en HOME har hatt (unionen over øktene som har
+  brukt den), lagres på hosten ved siden av øktene (`.<ID>.caps`). Gir en
+  `--resume` HOME-en mer enn det, f.eks. en HOME fra `--net @all`
+  gjenopptatt med `--work rw`, advarer wrapperen før noe startes og
+  lister utvidelsene (`work rw`, `@all`, `host:PORT`, nye poster). Etter
+  `@all` regnes navn som dekket, IP-literaler ikke (private adresser er
+  stengt også i åpen modus). Økter fra før dette ble lagret, gir en egen
+  advarsel ved første resume.
 - Workdir (`/work`) er ikke en del av økta: med `--work rw` ser også neste
   nye økt endringer der (f.eks. prosjektets `.claude/settings.json` eller
   `CLAUDE.md`). I overlay-modus (default) når de workdir bare når du
