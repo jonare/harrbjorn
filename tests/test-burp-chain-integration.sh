@@ -21,7 +21,7 @@
 #  1. Smokescreen publisert kun på hostens loopback, kun på podman-nettet
 #  2. tillatt mål (IP-literal, CONNECT og ren HTTP) nås gjennom kjeden
 #  3. enforce: navn utenfor allowlisten og loopback avvises
-#  4. open (-a '*'): loopback avvises av IP-filteret, tillatt mål nås
+#  4. open (--net @all): loopback avvises av IP-filteret, tillatt mål nås
 #  5. kanarisjekken: kjedet Burp godkjennes, direkte Burp avvises (begge
 #     moduser)
 #
