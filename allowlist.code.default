@@ -1,5 +1,8 @@
 # Default allowlist for the sbx forward proxy (one entry per line, '#' comments).
-# Format: host (ports 80+443), host:port, *.domain (wildcard), IP[:port] literal.
+# Format: host, *.domain (subdomains only, not domain itself), IP, IP:port,
+# [IPv6]:port. The proxy (Smokescreen) has no port dimension for names or
+# public IPs: host, host:port and public IP:port all grant EVERY port. Only
+# IP:port for a private/loopback/link-local IP stays port-scoped.
 
 # --- Claude Code (LLM API + CLI infrastructure) ---
 api.anthropic.com

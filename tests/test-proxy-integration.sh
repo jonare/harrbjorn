@@ -119,7 +119,7 @@ start_stack() {
   printf '%s\n' host.containers.internal api.github.com > "$merged"
 
   pol="$T/pol-$mode"; mkdir -p "$pol"
-  MERGED="$merged" SBX_OPEN_NETWORK="$open" \
+  MERGED="$merged" OPEN_EGRESS="$open" \
     PROXY_TRUSTED="host.containers.internal:$ORIGIN_PORT" \
     PROXY_PORT="$PROXY_PORT" \
     sbx_write_proxy_policy "$pol" || die "policy-generering feilet ($mode)"
@@ -136,14 +136,14 @@ start_stack() {
 
   $PODMAN run -d --name "$proxy" \
     "${RUNTIME_ARGS[@]}" \
-    --userns=keep-id:uid=$(id -u),gid=$(id -g) \
+    --userns=keep-id:uid=1000,gid=1000 \
     --network podman --network "$net" \
     -v "$resolv:/etc/resolv.conf:ro,z" \
     -v "$pol:/config:ro,z" \
     --read-only --tmpfs /tmp \
     --cap-drop ALL --security-opt no-new-privileges \
     --user 65534:65534 \
-    --memory 256m --pids-limit 128 --ulimit nofile=65536:65536 \
+    --memory 256m --pids-limit 128 --ulimit "nofile=$(sbx_nofile_limit "$(ulimit -Hn)"):$(sbx_nofile_limit "$(ulimit -Hn)")" \
     "$PROXY_IMAGE" --config-file /config/proxy.yaml >/dev/null \
     || die "proxy-container startet ikke ($mode)"
 

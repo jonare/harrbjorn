@@ -9,7 +9,8 @@ per usecase.
 
 `build_image` i `lib/sandbox.sh` bygger **bare** hvis bildet mangler, med mindre
 `--rebuild` gis. Endringer i kilde som bakker inn i bildene — `code/sbx-init.sh`,
-`code/Dockerfile`, `pentest/Dockerfile`, `proxy/Dockerfile` — **propagerer ikke**
+`code/Dockerfile`, `pentest/Dockerfile`, `proxy/Dockerfile`, `relay/Dockerfile`,
+`relay/relay.sh` — **propagerer ikke**
 til allerede bygd bilder. Et eksisterende bilde er stale så lenge det ikke bygges
 på nytt, selv om kilde har endret seg.
 
