@@ -1,0 +1,8 @@
+# @anthropic — Claude Code: the API plus login and CLI infrastructure.
+# Added implicitly when the model config has no ANTHROPIC_BASE_URL.
+api.anthropic.com
+claude.ai
+claude.com
+platform.claude.com
+downloads.claude.ai
+code.claude.com

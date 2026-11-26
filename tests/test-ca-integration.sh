@@ -80,7 +80,7 @@ echo "git=$(git ls-remote "${u}repo" 2>&1 | tr "\n" " ")"'
 
 session() { # [--ca-cert FILE] -> probe output
   ANTHROPIC_API_KEY=dummy SBX_CLAUDE_CONFIG=/nonexistent \
-    "$T_REPO/harrbjorn" code -w "$WD" -H "$PORT" "$@" sh -c "$PROBE" _ "$PORT" 2>"$T_TMP/session.err"
+    "$T_REPO/harrbjorn" code -w "$WD" --net "host:$PORT" "$@" sh -c "$PROBE" _ "$PORT" 2>"$T_TMP/session.err"
 }
 line() { sed -n "s/^$1=//p" <<< "$2"; }
 

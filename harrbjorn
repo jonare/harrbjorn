@@ -18,7 +18,8 @@
 # Eksempler:
 #   harrbjorn code                               # interaktiv bash i cwd (default)
 #   harrbjorn code claude                        # interaktiv claude i cwd
-#   harrbjorn security -a 10.0.0.5:8080 claude -p "Test målet"
+#   harrbjorn code --net @dev --work rw claude   # pakkeregistre + GitHub, skrivbar workdir
+#   harrbjorn security --net 10.0.0.5:8080 claude -p "Test målet"
 #   harrbjorn code -p 127.0.0.1:4321 claude      # eksterne proxy (Burp); CA auto-installas
 
 set -euo pipefail
@@ -27,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() { sed -n '2,/^[^#]/{/^#/p}' "$0"; exit "${1:-0}"; }
 
 # Autocomplete (bash): fullfører subkommandoene (code, security) og
-# usecase-flaggene (-w -a -H -f -p --rebuild --work --no-default-allowlist --ca-cert --resume --sessions). Eval-eres fra ~/.bashrc:
+# usecase-flaggene (-w --net --work -p --ca-cert --rebuild --resume --sessions). Eval-eres fra ~/.bashrc:
 #   eval "$(harrbjorn completion)"
 completion() {
   cat <<'EOF'
@@ -39,7 +40,7 @@ _harrbjorn() {
   if (( COMP_CWORD == 1 )); then
     COMPREPLY=($(compgen -W "code security help completion" -- "$cur"))
   elif [[ "$cmd" == code || "$cmd" == security ]] && [[ "$cur" == -* ]]; then
-    COMPREPLY=($(compgen -W "-w -a -H -f -p --rebuild --work --no-default-allowlist --ca-cert --resume --resume= --sessions --help -- -" -- "$cur"))
+    COMPREPLY=($(compgen -W "-w --net --work -p --ca-cert --rebuild --resume --resume= --sessions --help -- -" -- "$cur"))
   fi
   return 0
 }

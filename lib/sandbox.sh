@@ -6,16 +6,16 @@
 #   SBX_USECASE            code|pentest (logglinjer + container-navn)
 #   SBX_IMAGE              bildet som bygges ved behov og kjøres
 #   SBX_CONTEXT            build-kontekst (direktori med Dockerfile)
-#   SBX_ALLOWLIST_DEFAULT  default-allowlisten (fil i repo-rotten)
-# Allowlisten håndheves alltid; åpen utgang er allowlistposten '*' (f.eks.
-# -a '*'), aldri en env-innstilling (SBX_OPEN_NETWORK ignoreres).
+# Nett og workdir er capabilities fra kommandolinja (--net, --work), ikke
+# fra usecasen: uten --net er bare modellendepunktet åpent, og åpen utgang
+# er --net @all, aldri en env-innstilling (SBX_OPEN_NETWORK ignoreres).
 # Wrapperen definerer i tillegg sbx_usage() som skriver sin egen hjelpetekst
 # og avslutter med gitt exit-kode.
 #
 # Runtime: rootless Podman, --userns=keep-id, per-sesjon nett (podman network
 # --internal) med per-sesjon proxy som eneste utgang. Med -p er nettet
 # fortsatt --internal, og en relay til den eksterne proxyen (+ modellport og
-# -H-porter) er eneste utgang; den eksterne proxyen har per-sesjon-proxyen
+# hostporter) er eneste utgang; den eksterne proxyen har per-sesjon-proxyen
 # som upstream, så allowlisten gjelder også da (fail-closed: ingen fallback
 # hvis proxyen ikke svarer eller ikke sender videre). Ingen sudo: hosten berøres aldri
 # (nattverks-isolasjon kjører i nettverket, ikke i iptables).
@@ -34,9 +34,8 @@ STATE_DIR="$SCRIPT_DIR/.sandbox"
 SBX_USECASE="${SBX_USECASE:-code}"
 SBX_IMAGE="${SBX_IMAGE:-harrbjorn/code:latest}"
 SBX_CONTEXT="${SBX_CONTEXT:-code}"
-SBX_ALLOWLIST_DEFAULT="${SBX_ALLOWLIST_DEFAULT:-allowlist.code.default}"
-# Egress mode for the proxy policy: 1 only when the allowlist has '*'
-# (set in sbx_main; internal, not read from env).
+# Egress mode for the proxy policy: 1 only with --net @all (set in
+# sbx_main; internal, not read from env).
 OPEN_EGRESS=0
 
 # Porten harrbjorns egen proxy lytter på (container-side). Ved -p er den
@@ -394,6 +393,117 @@ for link in data:
   return 1
 }
 
+# ------------------------------------------------------------ network (--net)
+# --net LIST (repeatable, comma-separated) is the session's network
+# capability. Without it only the model endpoint is open (added in sbx_main
+# from the model config). Items:
+#   host, *.domain, IP, IP:port, [IPv6]:port — allowlist entries (format:
+#     README «Nett»; validated by sbx_write_proxy_policy)
+#   host:PORT — a host port, reached via host.containers.internal
+#   @name     — a set: ~/.config/harrbjorn/net/<name>, else net/<name> here
+#   @path     — a set from a file (the item contains '/')
+#   @all      — open egress; combines only with host:PORT
+# A set file holds the same items, any number per line ('#' comments),
+# except @all and @path, so what is opened beyond named sets shows on the
+# command line. No set file may lie inside the workdir: the agent writes
+# there and could widen the next session. Widening is command-line only,
+# never env/.env.
+SBX_NET_NAME_RE='^[A-Za-z0-9_][A-Za-z0-9._-]*$'
+
+_sbx_has() { local x="$1" y; shift; for y in "$@"; do [[ "$y" == "$x" ]] && return 0; done; return 1; }
+
+# sbx_resolve_net WORKDIR ITEM... — fill the caller's NET_ENTRIES,
+# HOST_PORTS, OPEN_EGRESS and NET_SETS ("@set (file)") from the --net
+# items; fails with a message on a bad item.
+sbx_resolve_net() {
+  local wd item
+  wd="$(realpath -m -- "$1")"; shift
+  NET_ENTRIES=() HOST_PORTS=() OPEN_EGRESS=0 NET_SETS=()
+  _SBX_NET_SEEN=() _SBX_NET_OTHER=0
+  for item in "$@"; do
+    _sbx_net_items "$wd" "$item" "" || return 1
+  done
+  if (( OPEN_EGRESS && _SBX_NET_OTHER )); then
+    echo "error: --net @all opens every public destination; it combines only with host:PORT." >&2
+    return 1
+  fi
+}
+
+# _sbx_net_items WORKDIR LIST FROM — one comma-separated list; FROM is the
+# set file it came from ("" for the command line).
+_sbx_net_items() {
+  local wd="$1" from="$3" items=() i p f where="--net"
+  [[ -n "$from" ]] && where="--net: $from"
+  IFS=',' read -r -a items <<< "$2"
+  for i in ${items[@]+"${items[@]}"}; do
+    i="${i#"${i%%[![:space:]]*}"}"; i="${i%"${i##*[![:space:]]}"}"
+    [[ -n "$i" ]] || continue
+    case "$i" in
+      @all)
+        if [[ -n "$from" ]]; then echo "error: $where: @all is allowed on the command line only." >&2; return 1; fi
+        OPEN_EGRESS=1 ;;
+      @*/*)
+        if [[ -n "$from" ]]; then echo "error: $where: a set file can include named sets only ($i)." >&2; return 1; fi
+        _sbx_net_file "$wd" "${i#@}" "$i" || return 1 ;;
+      @*)
+        if [[ ! "${i#@}" =~ $SBX_NET_NAME_RE ]]; then echo "error: $where: bad set name '$i'." >&2; return 1; fi
+        f="$HOME/.config/harrbjorn/net/${i#@}"
+        [[ -f "$f" ]] || f="$SCRIPT_DIR/net/${i#@}"
+        if [[ ! -f "$f" ]]; then
+          echo "error: $where: unknown set $i (neither ~/.config/harrbjorn/net/${i#@} nor $SCRIPT_DIR/net/${i#@})." >&2
+          return 1
+        fi
+        _sbx_net_file "$wd" "$f" "$i" || return 1 ;;
+      host:*)
+        p="${i#host:}"
+        if [[ ! "$p" =~ ^[0-9]{1,5}$ ]] || ! (( 10#$p >= 1 && 10#$p <= 65535 )); then
+          echo "error: $where: bad host port '$i' (need host:PORT, 1-65535)." >&2; return 1
+        fi
+        p=$((10#$p))
+        _sbx_has "$p" ${HOST_PORTS[@]+"${HOST_PORTS[@]}"} || HOST_PORTS+=("$p") ;;
+      '*')
+        echo "error: $where: '*' is not an entry; open egress is --net @all." >&2; return 1 ;;
+      *)
+        _SBX_NET_OTHER=1
+        _sbx_has "$i" ${NET_ENTRIES[@]+"${NET_ENTRIES[@]}"} || NET_ENTRIES+=("$i") ;;
+    esac
+  done
+  return 0
+}
+
+# _sbx_net_file WORKDIR FILE LABEL — read a set file, each line a list. A
+# file already read is skipped (sets included twice, include cycles).
+_sbx_net_file() {
+  local wd="$1" f="$2" label="$3" real line
+  if [[ ! -f "$f" || ! -r "$f" ]]; then
+    echo "error: --net $label: not a readable file: $f" >&2; return 1
+  fi
+  real="$(realpath -- "$f")"
+  if _sbx_under "$real" "$wd"; then
+    echo "error: --net $label: $f lies inside the workdir ($wd), where the agent writes; keep set files outside it." >&2
+    return 1
+  fi
+  _sbx_has "$real" ${_SBX_NET_SEEN[@]+"${_SBX_NET_SEEN[@]}"} && return 0
+  _SBX_NET_SEEN+=("$real")
+  NET_SETS+=("$label (${f#"$SCRIPT_DIR/"})")
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    _sbx_net_items "$wd" "${line%%#*}" "$f" || return 1
+  done < "$f"
+  return 0
+}
+
+# sbx_url_host URL — the allowlist entry for a remote model base URL: its
+# host, lowercased, userinfo dropped. An IP literal keeps an explicit port
+# (port-scoped for private IPs); a name does not (no port dimension).
+sbx_url_host() {
+  [[ "$1" == *://* ]] || return 0
+  local hp="${1#*://}"
+  hp="${hp%%[/?#]*}"; hp="${hp##*@}"; hp="${hp,,}"
+  if [[ "$hp" =~ ^\[(.*)\]$ ]]; then echo "${BASH_REMATCH[1]}"
+  elif [[ "$hp" =~ ^\[.*\]:[0-9]+$ || "$hp" =~ ^[0-9.]+(:[0-9]+)?$ ]]; then echo "$hp"
+  else echo "${hp%:*}"; fi
+}
+
 # ------------------------------------------------------------ proxy policy
 # Generate Smokescreen's per-session config under $1 (mounted ro at /config
 # in the proxy container):
@@ -411,14 +521,14 @@ for link in data:
 #    same as the old proxy.py open mode.
 #  - enforce mode → default action enforce with the merged allowlist as
 #    allowed_domains.
-#  - The trusted host (model server base_url port + -H ports) is a
+#  - The trusted host (model server base_url port + host ports) is a
 #    port-scoped exception: 169.254.1.2 is the pasta link-local host
 #    address (host.containers.internal) which the IP filter denies by
 #    default, so allow_addresses opens just the listed ports — never
 #    all ports. In enforce mode the hostname also goes into
 #    allowed_domains so the ACL accepts it.
 #
-# Allowlist entries (unchanged user-facing format): host, *.wildcard,
+# Allowlist entries (--net, README «Nett»): host, *.wildcard,
 # IP, IP:port, [IPv6]:port. Two semantic differences from proxy.py:
 #  - hostname:port loses its port scoping (the ACL has no port dimension;
 #    the entry grants the host on all ports, subject to the IP filter);
@@ -499,7 +609,7 @@ for raw in open(merged):
 
     if ip is not None and ip == HOST_ADDR:
         warn(f"'{line}': {ip} is the host (host.containers.internal) — skipped; "
-             "the host is reachable only through its trusted ports (-H PORT, model port)")
+             "the host is reachable only through its trusted ports (--net host:PORT, model port)")
         continue
     if ip is not None:
         # IP literal: needs an ACL entry plus an IP-filter exception
@@ -516,7 +626,7 @@ for raw in open(merged):
     elif host is not None:
         add_acl(host)
 
-# Trusted host: port-scoped exception (model server + -H ports).
+# Trusted host: port-scoped exception (model server + host ports).
 for t in (x for x in trusted_csv.split(',') if x.strip()):
     t = t.strip()
     name, _, p = t.rpartition(':')
@@ -749,7 +859,7 @@ sbx_out_finish() {
 # (reaches the host and the external proxy) + the session's --internal net
 # (reaches the sandbox). Each SPEC is LISTEN:HOST:PORT. The sandbox reaches
 # nothing but these ports. Sets RELAY_NAME (for cleanup) and RELAY_IP.
-# Listening below 1024 (-H 443 etc.) as uid 65534 needs
+# Listening below 1024 (host:443 etc.) as uid 65534 needs
 # ip_unprivileged_port_start=0 in the relay's own netns. Under krun that
 # sysctl only reaches the host-side netns — the guest kernel keeps 1024 and
 # grants no capabilities from --cap-drop/--user — so the relay runs as root
@@ -798,41 +908,28 @@ sbx_start_relay() {
 # published on 127.0.0.1:UPSTREAM_PORT only (the external proxy on the host
 # reaches it there, the LAN does not) and sits on pasta's default network
 # alone — not on the session net, so the sandbox reaches it only through
-# the external proxy. The trusted host ports (model, -H) go through the
-# relay and are never opened here. Ordered this way round, Smokescreen
+# the external proxy. The trusted host ports (model, host:PORT) go through
+# the relay and are never opened here. Ordered this way round, Smokescreen
 # resolves and connects itself, so the ACL and IP filter hold for the
 # address it dials; the external proxy's own lookups do not matter.
 sbx_start_proxy() {
   local S="$1" MODE_TAG="$2" UPSTREAM_PORT="${3:-}" MERGED
 
   # --------------------------------------------------------- allowlist
+  # Per-session allowlist: --net entries + the model endpoint (NET_ENTRIES,
+  # sbx_main). Concurrent sessions must not share one file — each proxy
+  # loads whatever the other session wrote last. The host ports are not
+  # entries (PROXY_TRUSTED).
   mkdir -p "$STATE_DIR"
-  [[ -f "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" ]] \
-    || { echo "error: allowlist default '$SBX_ALLOWLIST_DEFAULT' not found" >&2; exit 1; }
-  # Per-session merged allowlist: concurrent sessions (code + pentest) must
-  # not share one file — each proxy loads whatever the other session wrote
-  # last, and -a targets would be lost.
   MERGED="$STATE_DIR/allowlist-$S.txt"
-  # --no-default-allowlist: only -a/-f (and the trusted host ports, which
-  # are not allowlist entries) — the profile for a local model, where the
-  # default hosts (LLM APIs, GitHub, package registries) are only exfil and
-  # download channels.
   {
     echo "# merged at $(date -u +%Y-%m-%dT%H:%M:%SZ) by harrbjorn $SBX_USECASE"
-    if (( ! NO_DEFAULT_ALLOWLIST )); then
-      grep -vE '^\s*(#|$)' "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" || true
-    fi
-    for h in ${EXTRA_HOSTS[@]+"${EXTRA_HOSTS[@]}"}; do echo "$h"; done
-    if [[ -n "$EXTRA_ALLOWLIST" ]]; then
-      grep -vE '^\s*(#|$)' "$EXTRA_ALLOWLIST" || true
-    fi
-  } | grep -vxE '[[:space:]]*\*[[:space:]]*' | sort -u > "$MERGED"   # '*' = mode, not a domain
+    for h in ${NET_ENTRIES[@]+"${NET_ENTRIES[@]}"}; do echo "$h"; done
+  } | sort -u > "$MERGED"
 
   # -------------------------------------------------------- proxy policy
-  # Smokescreen config (proxy.yaml + acl.yaml), generated from the merged
-  # allowlist + egress mode + trusted host; mounted at /config in the proxy.
-  # The allowlist keeps its user-facing format; only the generated policy
-  # is new. Generation failure aborts before any session resource leaks
+  # Smokescreen config (proxy.yaml + acl.yaml), generated from the
+  # allowlist + egress mode + trusted host; mounted at /config in the proxy. Generation failure aborts before any session resource leaks
   # (the EXIT trap cleans up what exists so far).
   POLICY_DIR="$STATE_DIR/proxy-$S"
   mkdir -p "$POLICY_DIR"
@@ -961,21 +1058,16 @@ sbx_check_runtime() {
 }
 
 sbx_main() {
-  local WORKDIR="" EXT_PROXY="" EXTRA_HOSTS=() EXTRA_ALLOWLIST=""
-  local HOST_PORTS=()
-  local REBUILD=0 NO_DEFAULT_ALLOWLIST=0 WORK=overlay OVL_DIR="" OUT_DIR="" CA_FILES=() CA_PEM="" RESUME=0 RESUME_ID="" LIST_SESSIONS=0 T CONFIG_ENV=() MODEL_ENV=() PROXY_ENV=() MOUNTS=()
+  local WORKDIR="" EXT_PROXY="" NET_ARGS=() NET_ENTRIES=() NET_SETS=() HOST_PORTS=()
+  local REBUILD=0 WORK=overlay OVL_DIR="" OUT_DIR="" CA_FILES=() CA_PEM="" RESUME=0 RESUME_ID="" LIST_SESSIONS=0 T CONFIG_ENV=() MODEL_ENV=() PROXY_ENV=() MOUNTS=()
   local S SBX_NAME PROXY_TRUSTED="" RUNTIME_ARGS=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -w) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
           WORKDIR="$2"; shift 2 ;;
-      -a) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
-          EXTRA_HOSTS+=("$2"); shift 2 ;;
-      -H) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
-          HOST_PORTS+=("$2"); shift 2 ;;
-      -f) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
-          EXTRA_ALLOWLIST="$2"; shift 2 ;;
+      --net) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
+          NET_ARGS+=("$2"); shift 2 ;;
       -p) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
           EXT_PROXY="$2"; shift 2 ;;
       --work) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
@@ -986,7 +1078,6 @@ sbx_main() {
       --sessions) LIST_SESSIONS=1; shift ;;
       --ca-cert) [[ $# -ge 2 ]] || { echo "error: $1 requires an argument" >&2; sbx_usage 1; }
           CA_FILES+=("$2"); shift 2 ;;
-      --no-default-allowlist) NO_DEFAULT_ALLOWLIST=1; shift ;;
       -h|--help) sbx_usage 0 ;;
       --) shift; break ;;
       -*) echo "error: unknown option: $1" >&2; sbx_usage 1 ;;
@@ -1024,7 +1115,7 @@ sbx_main() {
   # vars are only a hint a hostile agent ignores, so the "no raw egress"
   # layer must not depend on them. A per-session relay (sbx_start_relay) is
   # the sandbox's only way out — to the external proxy, the model server and
-  # the -H ports, nothing else. Fail-closed: if nothing answers on the port
+  # the host ports, nothing else. Fail-closed: if nothing answers on the port
   # the session aborts before any resource exists, and if the external
   # proxy does not send on to Smokescreen (sbx_burp_chained) it aborts
   # before the sandbox starts — no fallback. The checks run from the host,
@@ -1069,31 +1160,22 @@ sbx_main() {
   # .env wins; the value is not re-derived from the host on purpose (a C host
   # would silently re-break it).
   local SBX_LOCALE="${SBX_LOCALE:-nb_NO.UTF-8}"
-  # Egress: the allowlist is enforced in both usecases. Open egress is the
-  # allowlist entry '*' (-a '*', a line in the -f file or the default
-  # allowlist) — an explicit choice per session, never env: an exported
+  # Egress: --net (sbx_resolve_net) is the session's network capability,
+  # resolved here before any resource exists. Open egress is --net @all —
+  # an explicit choice per session, never env: an exported
   # SBX_OPEN_NETWORK from one session must not silently open another.
   if [[ -n "${SBX_OPEN_NETWORK+x}" ]]; then
-    echo "warn: SBX_OPEN_NETWORK is ignored; egress follows the allowlist (open egress: -a '*')." >&2
+    echo "warn: SBX_OPEN_NETWORK is ignored; egress follows --net (open egress: --net @all)." >&2
   fi
-  local OPEN_EGRESS=0 h
-  for h in ${EXTRA_HOSTS[@]+"${EXTRA_HOSTS[@]}"}; do [[ "$h" == '*' ]] && OPEN_EGRESS=1; done
-  if [[ -n "$EXTRA_ALLOWLIST" ]] && grep -qxE '[[:space:]]*\*[[:space:]]*' "$EXTRA_ALLOWLIST" 2>/dev/null; then
-    OPEN_EGRESS=1
-  fi
-  if (( ! NO_DEFAULT_ALLOWLIST )) && grep -qxE '[[:space:]]*\*[[:space:]]*' "$SCRIPT_DIR/$SBX_ALLOWLIST_DEFAULT" 2>/dev/null; then
-    OPEN_EGRESS=1
-  fi
+  local OPEN_EGRESS=0
+  sbx_resolve_net "$WORKDIR_ABS" ${NET_ARGS[@]+"${NET_ARGS[@]}"} || exit 1
   # OCI runtime: krun (microVM, default) / runsc / crun. Checked hard in
   # sbx_check_runtime (below, after the podman checks) — no silent fallback.
   local SBX_RUNTIME="${SBX_RUNTIME:-krun}"
   local MODE_TAG=""
   if (( OPEN_EGRESS )); then
     MODE_TAG=", open network"
-    echo "warn: open egress ('*' in the allowlist): every public destination is reachable (logged; private, loopback and link-local stay blocked)." >&2
-  fi
-  if (( NO_DEFAULT_ALLOWLIST && OPEN_EGRESS )); then
-    echo "warn: --no-default-allowlist has no effect with open egress (no allowlist is enforced)." >&2
+    echo "warn: open egress (--net @all): every public destination is reachable (logged; private, loopback and link-local stay blocked)." >&2
   fi
   # -p: the port harrbjorn's proxy is published on as the external proxy's
   # upstream. Fixed (the external proxy's upstream setting is static), so
@@ -1129,7 +1211,7 @@ sbx_main() {
   # default ~/claude.sh) — same model, effort, context window and key — with
   # one rewrite: a loopback ANTHROPIC_BASE_URL is pointed at the host through
   # host.containers.internal (pasta host address) instead of localhost. The
-  # host address is a *trusted* proxy upstream (SBX_PROXY_TRUSTED below) —
+  # host address is a *trusted* proxy upstream (PROXY_TRUSTED below) —
   # it is a runtime exception, never a user allowlist entry. Only `export ...`
   # lines are evaluated, so the file's comments and trailing `claude ...`
   # invocation are ignored. The result is injected as env vars, standalone;
@@ -1183,7 +1265,7 @@ sbx_main() {
   # holds NAME=VALUE and is exported only into the environment of the final
   # `podman run`, which gets bare `-e NAME` (podman copies the value from
   # its own environment).
-  local rec cfg_url="" cfg_port
+  local rec cfg_url="" cfg_port=""
   if [[ -f "$SBX_CLAUDE_CONFIG" ]]; then
     while IFS= read -r -d '' rec; do
       MODEL_ENV+=("$rec")
@@ -1206,31 +1288,47 @@ sbx_main() {
     CONFIG_ENV+=(-e "${rec%%=*}")
   done
 
+  # ------------------------------------------- model endpoint (implicit)
+  # Always open, derived from the model config, never a --net item: a local
+  # model server is a trusted host port (above); a remote base URL opens
+  # its host; no base URL (Claude Code with a key, or its own login in the
+  # session) opens @anthropic. Moot with @all.
+  local model_net="" net_desc
+  if [[ -n "$cfg_port" ]]; then
+    model_net="host.containers.internal:$cfg_port"
+  elif (( OPEN_EGRESS )); then
+    model_net="(open egress)"
+  elif [[ -n "$cfg_url" ]]; then
+    model_net="$(sbx_url_host "$cfg_url")"
+    if [[ -n "$model_net" ]] && ! _sbx_has "$model_net" ${NET_ENTRIES[@]+"${NET_ENTRIES[@]}"}; then
+      NET_ENTRIES+=("$model_net")
+    fi
+  else
+    _sbx_net_items "$WORKDIR_ABS" @anthropic "" || exit 1
+    model_net="@anthropic"
+  fi
+  net_desc="${NET_ARGS[*]-}"
+  echo ">> net: ${net_desc:-(model only)}; model endpoint: ${model_net:-n/a}"
+  if (( ${#NET_SETS[@]} )); then echo ">> net sets: ${NET_SETS[*]}"; fi
+
   # ---------------------------------------------------- host ports (explicit)
-  # -H <port>: host ports the sandbox may reach (test instances on the host,
-  # e.g. 8080). Each port becomes a trusted proxy upstream for
+  # --net host:PORT: host ports the sandbox may reach (test instances on the
+  # host, e.g. 8080). Each port becomes a trusted proxy upstream for
   # host.containers.internal — an explicit, per-port runtime exception.
   # The host address is link-local, so the proxy's always-deny and
-  # DNS-rebind guards refuse it no matter what the user allowlist (or open
+  # DNS-rebind guards refuse it no matter what the allowlist (or open
   # network) says: the host is only ever reachable here.
   local p
-  if (( ${#HOST_PORTS[@]} )); then
-    for p in "${HOST_PORTS[@]}"; do
-      p="${p//[[:space:]]/}"
-      if [[ ! "$p" =~ ^[0-9]+$ ]] || ! (( p >= 1 && p <= 65535 )); then
-        echo "error: -H: bad port '$p' (need 1-65535)" >&2
-        sbx_usage 1
-      fi
-      case " $PROXY_TRUSTED " in
-        *" host.containers.internal:$p "*) ;;
-        *) PROXY_TRUSTED="${PROXY_TRUSTED:+$PROXY_TRUSTED,}host.containers.internal:$p" ;;
-      esac
-    done
-    echo ">> host ports: ${HOST_PORTS[*]} (via host.containers.internal)"
-  fi
+  for p in ${HOST_PORTS[@]+"${HOST_PORTS[@]}"}; do
+    case ",$PROXY_TRUSTED," in
+      *",host.containers.internal:$p,"*) ;;
+      *) PROXY_TRUSTED="${PROXY_TRUSTED:+$PROXY_TRUSTED,}host.containers.internal:$p" ;;
+    esac
+  done
+  if (( ${#HOST_PORTS[@]} )); then echo ">> host ports: ${HOST_PORTS[*]} (via host.containers.internal)"; fi
 
   # ------------------------------------------------------- relay specs (-p)
-  # The external proxy plus every trusted host port (model server, -H).
+  # The external proxy plus every trusted host port (model server, host:PORT).
   # In the sandbox host.containers.internal resolves to the relay, so each
   # host port is relayed on the same port number. A host port equal to the
   # external proxy's port only works when it IS the proxy.
@@ -1242,7 +1340,7 @@ sbx_main() {
       tp="${t##*:}"
       if [[ "$tp" == "$ext_port" ]]; then
         if [[ "$ext_target" != host.containers.internal ]]; then
-          echo "error: -p: host port $tp (model server or -H) collides with the external proxy's port $ext_port on another host." >&2
+          echo "error: -p: host port $tp (model server or host:PORT) collides with the external proxy's port $ext_port on another host." >&2
           exit 1
         fi
         continue
@@ -1387,7 +1485,7 @@ sbx_main() {
   # http://<proxy>/cert (fetched past the proxy env — the listener itself
   # serves it). host.containers.internal resolves to the relay (--add-host)
   # and is in NO_PROXY: an external proxy on the host cannot resolve that
-  # name, so host traffic (model server, -H ports) goes to the relay
+  # name, so host traffic (model server, host ports) goes to the relay
   # directly. The default branch must NOT list it there: on the --internal
   # net the host is only reachable through Smokescreen (PROXY_TRUSTED).
   local EXTRA_RUN=()

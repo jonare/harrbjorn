@@ -149,7 +149,7 @@ warn_absent "D: ULA advarer ikke"             "fd00::1"
 # ---------------------------------------------------------------- scenario E
 # Hostadressen (169.254.1.2 = host.containers.internal) som IP-literal ville
 # gitt et unntak fra IP-filteret for ALLE hostporter. Hosten nås kun via
-# trusted-settet (-H / modellporten): posten hoppes over med advarsel.
+# trusted-settet (--net host:PORT / modellporten): posten hoppes over med advarsel.
 LIST_E="$T/e.txt"
 printf '%s\n' 169.254.1.2 169.254.1.2:22 example.org > "$LIST_E"
 OUT_E="$T/out-e"
@@ -157,7 +157,7 @@ run "E" "$OUT_E" "$LIST_E" 0 ""
 check_absent "E: hostadressen ikke i allow_ranges"    "$OUT_E/proxy.yaml" "169\.254\.1\.2/32"
 check_absent "E: hostadressen ikke i allow_addresses" "$OUT_E/proxy.yaml" "169\.254\.1\.2:22"
 check_absent "E: hostadressen ikke i ACL-en"          "$OUT_E/acl.yaml" "169\.254\.1\.2"
-warn_check   "E: advarer og viser til -H"             "169\.254\.1\.2.*-H"
+warn_check   "E: advarer og viser til host:PORT"      "169\.254\.1\.2.*--net host:PORT"
 check        "E: andre poster beholdes"               "$OUT_E/acl.yaml" "example\.org"
 
 echo
