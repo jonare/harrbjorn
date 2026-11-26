@@ -88,6 +88,12 @@ for h in github.com registry.npmjs.org pypi.org files.pythonhosted.org repo1.mav
   assert_match "@dev har $h"                    "(^| )${h//./\\.} " "$R_ENTRIES"
 done
 assert_no_match "@dev har ikke Anthropic (modellen er implisitt)" 'anthropic|claude' "$R_ENTRIES"
+# GitHub videresender release-nedlastinger (github.com/.../releases/download)
+# til egne CDN-verter; uten dem feiler f.eks. pi sin nedlasting av fd.
+net @github
+for h in release-assets.githubusercontent.com objects.githubusercontent.com; do
+  assert_match "@github har $h (release-nedlastinger)" "(^| )${h//./\\.} " "$R_ENTRIES"
+done
 for f in "$T_REPO"/net/*; do
   if grep -qE '^[[:space:]]*(\*|@all)[[:space:]]*$' "$f"; then bad "$(basename "$f"): ingen '*'/@all" "har"; else ok "$(basename "$f"): ingen '*'/@all"; fi
 done

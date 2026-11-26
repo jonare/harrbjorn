@@ -1,5 +1,8 @@
-# @github — git over HTTPS, the API, archives and raw files.
+# @github — git over HTTPS, the API, archives and raw files, and the CDN
+# hosts release downloads (github.com/.../releases/download) redirect to.
 github.com
 api.github.com
 codeload.github.com
 raw.githubusercontent.com
+release-assets.githubusercontent.com
+objects.githubusercontent.com

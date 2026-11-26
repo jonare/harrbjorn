@@ -409,7 +409,7 @@ Settene i `net/`:
 | Sett | Innhold |
 |---|---|
 | `@anthropic` | Claude Code: API-et, innlogging og CLI-infrastruktur |
-| `@github` | `github.com`, API, arkiver, rå filer |
+| `@github` | `github.com`, API, arkiver, rå filer, release-nedlastinger |
 | `@npm` | `registry.npmjs.org` |
 | `@pypi` | `pypi.org`, `files.pythonhosted.org` |
 | `@maven` | Maven Central |
