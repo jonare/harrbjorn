@@ -7,13 +7,18 @@
 # by lib/sandbox.sh and bind-mounted read-only at /config; the proxy starts
 # with --config-file /config/proxy.yaml (the ACL path is inside it).
 
-FROM debian:bookworm-slim AS fetch
+FROM docker.io/library/debian:bookworm-slim@sha256:311f7a192fd9a92b165a86b32fa3aae9005b11849bfb1db2d4fd784559ee464f AS fetch
 ARG SMOKESCREEN_VERSION=v0.1.0
 # sha256 of smokescreen_v0.1.0_linux_amd64.tar.gz per the release's SHA256SUMS
 ARG SMOKESCREEN_SHA256=4e1e447449e3cc653dae956208588722b5c8fe8ce894f633adc756a851d1ec46
-RUN apt-get update \
+# Extra CAs (harrbjorn --ca-cert / SBX_CA_CERTS) arrive as the build secret
+# sbx_ca; this stage is discarded, so nothing of them reaches the image.
+RUN --mount=type=secret,id=sbx_ca \
+    apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates wget \
-    && wget -qO /tmp/smokescreen.tar.gz \
+    && ca=/etc/ssl/certs/ca-certificates.crt \
+    && if [ -s /run/secrets/sbx_ca ]; then cat "$ca" /run/secrets/sbx_ca > /tmp/ca.pem && ca=/tmp/ca.pem; fi \
+    && wget -qO /tmp/smokescreen.tar.gz --ca-certificate="$ca" \
        "https://github.com/stripe/smokescreen/releases/download/${SMOKESCREEN_VERSION}/smokescreen_${SMOKESCREEN_VERSION}_linux_amd64.tar.gz" \
     && echo "${SMOKESCREEN_SHA256}  /tmp/smokescreen.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/smokescreen.tar.gz -C /tmp \

@@ -37,7 +37,7 @@ run() { # label outdir allowlist open trusted
   local label="$1" out="$2" list="$3" open="$4" trusted="$5"
   mkdir -p "$out"
   cp "$list" "$MERGED"
-  SBX_OPEN_NETWORK="$open"
+  OPEN_EGRESS="$open"
   PROXY_TRUSTED="$trusted"
   ERR="$(sbx_write_proxy_policy "$out" 2>&1 || true)"
   # All genererte filer må være gyldig YAML.
@@ -48,6 +48,11 @@ run() { # label outdir allowlist open trusted
     fi
   done
   WARN="$(printf '%s\n' "$ERR")"
+}
+warn_absent() { # label pattern-not-in-warn-output
+  if printf '%s\n' "$WARN" | grep -q "$2"; then fail=$((fail+1)); echo "FAIL  $1 — uventet advarsel '$2'"; printf '%s\n' "$WARN"
+  else pass=$((pass+1)); echo "PASS  $1"
+  fi
 }
 warn_check() { # label pattern-in-warn-output
   if printf '%s\n' "$WARN" | grep -q "$2"; then pass=$((pass+1)); echo "PASS  $1"
@@ -125,6 +130,35 @@ check_absent "C: ingen adresse for dårlig trusted" "$R" "allow_addresses:"
 warn_check "C: advarer feil host"     "example\.com:8080"
 warn_check "C: advarer port for stor" "host\.containers\.internal:99999"
 warn_check "C: advarer ikke-numerisk" "host\.containers\.internal:abc"
+
+# ---------------------------------------------------------------- scenario D
+# IP:port for en offentlig IP — ACL-en har ingen portdimensjon, og
+# IP-filteret (som håndhever porten for private IP-er via allow_addresses)
+# slipper offentlige IP-er på alle porter. Det skal advares om; private
+# IP:port skal ikke gi advarsel.
+LIST_D="$T/d.txt"
+printf '%s\n' 203.0.113.5:443 '[2001:db8::1]:443' 192.168.50.10:8080 10.0.0.1:80 '[fd00::1]:443' > "$LIST_D"
+OUT_D="$T/out-d"
+run "D" "$OUT_D" "$LIST_D" 0 ""
+warn_check  "D: offentlig IPv4:port advarer"  "203\.0\.113\.5:443.*all ports"
+warn_check  "D: offentlig IPv6:port advarer"  "2001:db8::1.*all ports"
+warn_absent "D: privat IPv4:port advarer ikke" "192\.168\.50\.10"
+warn_absent "D: privat 10/8 advarer ikke"     "10\.0\.0\.1"
+warn_absent "D: ULA advarer ikke"             "fd00::1"
+
+# ---------------------------------------------------------------- scenario E
+# Hostadressen (169.254.1.2 = host.containers.internal) som IP-literal ville
+# gitt et unntak fra IP-filteret for ALLE hostporter. Hosten nås kun via
+# trusted-settet (-H / modellporten): posten hoppes over med advarsel.
+LIST_E="$T/e.txt"
+printf '%s\n' 169.254.1.2 169.254.1.2:22 example.org > "$LIST_E"
+OUT_E="$T/out-e"
+run "E" "$OUT_E" "$LIST_E" 0 ""
+check_absent "E: hostadressen ikke i allow_ranges"    "$OUT_E/proxy.yaml" "169\.254\.1\.2/32"
+check_absent "E: hostadressen ikke i allow_addresses" "$OUT_E/proxy.yaml" "169\.254\.1\.2:22"
+check_absent "E: hostadressen ikke i ACL-en"          "$OUT_E/acl.yaml" "169\.254\.1\.2"
+warn_check   "E: advarer og viser til -H"             "169\.254\.1\.2.*-H"
+check        "E: andre poster beholdes"               "$OUT_E/acl.yaml" "example\.org"
 
 echo
 echo "$pass passed, $fail failed"

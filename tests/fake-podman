@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# tests/fake-podman — stand-in for podman in unit tests of sbx_main.
+#
+# Logs every invocation as one line (args joined by single spaces) to
+# $FAKE_PODMAN_LOG and returns canned answers: images exist, `inspect -f`
+# prints a fixed IP, listings are empty, everything else succeeds. Nothing
+# is started, built, pulled or connected.
+#
+# Extras for assertions:
+#  - FAKE_PODMAN_ENV_KEYS="A B": on `run`, also log `env:A=<value>` for
+#    each of these present in podman's own environment
+#  - a `-v SRC:/config:ro...` mount (the proxy policy) is copied to
+#    $FAKE_PODMAN_LOG.config/ before the session cleanup removes SRC
+#  - FAKE_PODMAN_PATCH=FILE: a `run` with `-v DIR:/out:z` (the --overlay
+#    patch helper) copies FILE to DIR/changes.patch
+#  - FAKE_PODMAN_SANDBOX_RC: exit status of the sandbox run (`run --rm`
+#    with `--name sbx-...`)
+#  - `build --secret id=ID,src=FILE`: FILE is copied to
+#    $FAKE_PODMAN_LOG.secret-ID (the build CA is removed after the build)
+printf '%s\n' "$*" >> "${FAKE_PODMAN_LOG:?}"
+if [[ "$1" == run ]]; then
+  for k in ${FAKE_PODMAN_ENV_KEYS:-}; do
+    [[ -n "${!k+x}" ]] && printf 'env:%s=%s\n' "$k" "${!k}" >> "$FAKE_PODMAN_LOG"
+  done
+  prev=""
+  for a in "$@"; do
+    if [[ "$prev" == -v && "$a" == *:/config:ro* ]]; then
+      rm -rf "$FAKE_PODMAN_LOG.config"; cp -r "${a%%:*}" "$FAKE_PODMAN_LOG.config"
+    fi
+    if [[ "$prev" == -v && "$a" == *:/out:z && -n "${FAKE_PODMAN_PATCH:-}" ]]; then
+      cp "$FAKE_PODMAN_PATCH" "${a%%:*}/changes.patch"
+    fi
+    prev="$a"
+  done
+fi
+if [[ "$1" == build ]]; then
+  prev=""
+  for a in "$@"; do
+    if [[ "$prev" == --secret && "$a" =~ ^id=([^,]+),src=(.+)$ ]]; then
+      cp "${BASH_REMATCH[2]}" "$FAKE_PODMAN_LOG.secret-${BASH_REMATCH[1]}"
+    fi
+    prev="$a"
+  done
+fi
+#  - FAKE_PODMAN_PS / FAKE_PODMAN_NETS: names printed by `ps` / `network ls`
+#  - FAKE_PODMAN_RUNNING: answer to `inspect -f {{.State.Running}}` (false)
+#  - `logs NAME` prints "log-of NAME"
+case "$1" in
+  inspect) if [[ "$*" == *State.Running* ]]; then echo "${FAKE_PODMAN_RUNNING:-false}"; else echo 10.89.0.2; fi ;;
+  run)     [[ " $* " == *" -d "* ]] && echo fakecontainerid ;;
+  ps)      for n in ${FAKE_PODMAN_PS:-}; do echo "$n"; done ;;
+  network) if [[ "${2:-}" == ls ]]; then for n in ${FAKE_PODMAN_NETS:-}; do echo "$n"; done; fi ;;
+  logs)    echo "log-of ${*: -1}" ;;
+esac
+if [[ "$1" == run && " $* " == *" --rm "* && " $* " == *" --name sbx-"* ]]; then
+  exit "${FAKE_PODMAN_SANDBOX_RC:-0}"
+fi
+exit 0

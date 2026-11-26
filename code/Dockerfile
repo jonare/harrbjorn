@@ -1,11 +1,17 @@
 # harrbjorn code-agent sandbox: dev environment + agent CLIs (Claude Code,
 # pi) for autonomous code agents. Intended to run with:
 # --read-only --cap-drop ALL --security-opt no-new-privileges,
-# non-privileged user 1000, tmpfs /tmp /var/tmp /home/agent (see lib/sandbox.sh).
+# non-privileged user 1000, tmpfs /tmp /var/tmp, /home/agent a per-session
+# bind mount (see lib/sandbox.sh).
 # Base image pinned by digest; re-pin when the node line moves.
 FROM node:22-bookworm-slim@sha256:efd0ab5780c2d9ab1f0f869571a00d5edb17793bff4cce4a2792e3eb0ffc7562
 
-RUN apt-get update \
+# Extra CAs (harrbjorn --ca-cert / SBX_CA_CERTS, e.g. behind a TLS-
+# inspecting middlebox) arrive as the build secret sbx_ca: the HTTPS steps
+# below trust it for their fetches only; it is never written to a layer.
+# Without the secret the mount is empty and the steps run unchanged.
+RUN --mount=type=secret,id=sbx_ca \
+    apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -29,6 +35,7 @@ RUN apt-get update \
         zip \
         locales \
  && rm -rf /var/lib/apt/lists/* \
+ && if [ -s /run/secrets/sbx_ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/sbx_ca; fi \
  && npm install -g @anthropic-ai/claude-code@2.1.296 \
  && npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.3.0
 
@@ -42,11 +49,18 @@ RUN apt-get update \
 # home directly — sbx-init.sh copies it into $HOME/.pi/agent/npm on each run,
 # merging into any store the agent already has (the image is the source of
 # truth: extensions the agent removed are re-seeded on the next run, like the
-# model config). To add an extension, append it here, rebuild, and commit the
-# new image digest.
-ARG PI_EXTENSIONS=npm:pi-subagents
-RUN for src in $PI_EXTENSIONS; do PI_CODING_AGENT_DIR=/usr/local/share/pi/agent pi install "$src"; done \
- && rm -rf /root/.npm /root/.pi
+# model config). To add an extension, append it here and rebuild.
+# Each source pinned to an exact version (tests/test-image-pins.sh): the
+# packages install as root with lifecycle scripts and run with the agent's
+# rights. Bump deliberately.
+ARG PI_EXTENSIONS=npm:pi-subagents@0.90.0
+RUN --mount=type=secret,id=sbx_ca \
+    if [ -s /run/secrets/sbx_ca ]; then \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/sbx_ca > /tmp/sbx-ca.pem \
+      && export NODE_EXTRA_CA_CERTS=/run/secrets/sbx_ca GIT_SSL_CAINFO=/tmp/sbx-ca.pem; \
+    fi \
+ && for src in $PI_EXTENSIONS; do PI_CODING_AGENT_DIR=/usr/local/share/pi/agent pi install "$src"; done \
+ && rm -rf /root/.npm /root/.pi /tmp/sbx-ca.pem
 
 # The base image ships only the POSIX/C locale (LC_CTYPE=POSIX, single-byte),
 # which mis-handles the multi-byte UTF-8 a Norwegian keyboard emits for
