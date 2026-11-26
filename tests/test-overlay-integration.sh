@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/test-overlay-integration.sh — integrasjonstest for --overlay:
+# tests/test-overlay-integration.sh — integrasjonstest for --work overlay:
 # ekte podman, produksjonens mount-streng og sbx_overlay_finish.
 #
 # En «økt» (container i valgt runtime) skriver i /work via overlayen; så

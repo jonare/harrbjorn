@@ -21,7 +21,7 @@
 #  1. Smokescreen publisert kun på hostens loopback, kun på podman-nettet
 #  2. tillatt mål (IP-literal, CONNECT og ren HTTP) nås gjennom kjeden
 #  3. enforce: navn utenfor allowlisten og loopback avvises
-#  4. open (-a '*'): loopback avvises av IP-filteret, tillatt mål nås
+#  4. open (--net @all): loopback avvises av IP-filteret, tillatt mål nås
 #  5. kanarisjekken: kjedet Burp godkjennes, direkte Burp avvises (begge
 #     moduser)
 #
@@ -67,12 +67,12 @@ $PODMAN run -d --name "$ORIGIN" --runtime crun --network podman \
 O_IP="$($PODMAN inspect -f '{{(index .NetworkSettings.Networks "podman").IPAddress}}' "$ORIGIN")"
 
 # ---- Smokescreen via produksjonens sbx_start_proxy (upstream-modus) --------
-# Som i sbx_main med -p: målet som IP-literal (-a), ingen default-allowlist.
+# Som i sbx_main med -p: målet som IP-literal (--net), ingen andre poster.
 # PROXY_TRUSTED er satt (modellport) og skal ikke havne i Smokescreen.
 STATE_DIR="$T_TMP/state" NET_NAME="" SBX_NOFILE="$(sbx_nofile_limit "$(ulimit -Hn)")"
 start_stack() { # name open(0|1) port
   PROXY_NAME="$1"; STACKS+=("$1")
-  OPEN_EGRESS="$2" NO_DEFAULT_ALLOWLIST=1 EXTRA_HOSTS=("$O_IP:8080") EXTRA_ALLOWLIST=""
+  OPEN_EGRESS="$2" NET_ENTRIES=("$O_IP:8080")
   PROXY_TRUSTED="host.containers.internal:8000"
   ( sbx_start_proxy "$1" "" "$3" ) || die "sbx_start_proxy ($1)"
 }

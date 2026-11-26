@@ -2,7 +2,7 @@
 # tests/main-harness.sh — hermetic harness for unit tests of sbx_main.
 #
 # Source after tests/lib.sh. Builds, under $T_TMP:
-#   repo/   copy of lib/*.sh + allowlists (SCRIPT_DIR; .sandbox/ lands here)
+#   repo/   copy of lib/*.sh + net/ sets (SCRIPT_DIR; .sandbox/ lands here)
 #   home/   fake $HOME;  home/proj = default workdir
 #   bin/    fake crun + resolvectl first in PATH
 # and provides run_main ARGS... which runs sbx_main (code usecase, crun,
@@ -16,7 +16,7 @@
 HR="$T_TMP/repo"; HH="$T_TMP/home"; HB="$T_TMP/bin"; PLOG="$T_TMP/podman.log"
 mkdir -p "$HR/lib" "$HH/proj" "$HB"
 cp "$T_REPO"/lib/*.sh "$HR/lib/"
-cp "$T_REPO"/allowlist.*.default "$HR/"
+cp -r "$T_REPO/net" "$HR/"
 cp "$T_REPO/tests/fake-podman" "$HB/podman"
 printf '#!/bin/sh\nexit 0\n' > "$HB/crun"
 printf '#!/bin/sh\necho %s\n' "'[{\"currentServer\":{\"addressString\":\"192.0.2.53\"},\"servers\":[]}]'" > "$HB/resolvectl"
@@ -29,7 +29,7 @@ run_main() {
     cd "$HH/proj" &&
     HOME="$HH" PATH="$HB:$PATH" PODMAN="$HB/podman" FAKE_PODMAN_LOG="$PLOG" \
     SBX_RUNTIME=crun SBX_USECASE=code SBX_IMAGE=harrbjorn/code:latest \
-    SBX_CONTEXT=code SBX_ALLOWLIST_DEFAULT=allowlist.code.default \
+    SBX_CONTEXT=code \
     ANTHROPIC_API_KEY="${T_API_KEY-test-key}" \
     bash -c '
       source "$1/lib/sandbox.sh"

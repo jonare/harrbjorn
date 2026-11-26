@@ -13,12 +13,15 @@ sted — hele isolasjonen kjører i brukerens rootless netns/userns. Én CLI
 
 | Usecase | CLI | Wrapper | Bilde | Tooling |
 |---|---|---|---|---|
-| Kodeagent | `harrbjorn code` | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, claude + pi; allowlist-utgang (åpen kun med `-a '*'`) |
-| Sikkerhetstesting | `harrbjorn security` | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb; mål legges til med `-a` ved kjør |
+| Kodeagent | `harrbjorn code` | `run-code.sh` | `harrbjorn/code:latest` | node, python3, git, build-essential, claude + pi |
+| Sikkerhetstesting | `harrbjorn security` | `run-pentest.sh` | `harrbjorn/pentest:latest` | ovenstående + nmap, sqlmap, hydra, ffuf, whatweb |
 
 Isolasjonskjernen (per-sesjon nett, proxy, host-isolasjon via proxy-policy,
 model-injeksjon, agent-HOME) deles via `lib/sandbox.sh`; wrappers er tynne og
-setter bare `SBX_USECASE`/`SBX_IMAGE`/`SBX_CONTEXT`/`SBX_ALLOWLIST_DEFAULT`.
+setter bare `SBX_USECASE`/`SBX_IMAGE`/`SBX_CONTEXT`. Usecasen velger bildet
+(verktøyene); hva økten får av nett og workdir, er capabilities fra
+kommandolinja: `--net` (standard: bare modellen) og `--work` (standard:
+overlay).
 
 ## Trusselmodell
 
@@ -37,11 +40,14 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
 
 - **Nettverk:** ingen rå utgang. All trafikk går via proxyen (med `-p`:
   relayen og den eksterne proxyen, som har harrbjorns proxy som upstream),
-  allowlisten håndheves (også med `-p`; åpen kun med `-a '*'`), og private,
-  loopback-, link-local- og CGNAT-adresser avvises med mindre en IP-literal
-  i allowlisten eller trusted-settet slipper dem. Hostens tjenester nås
-  bare via trusted-portene (modellport, `-H`).
-- **Filsystem:** agenten skriver bare i `/work` og sin økts HOME
+  allowlisten håndheves (også med `-p`; åpen kun med `--net @all`), og
+  private, loopback-, link-local- og CGNAT-adresser avvises med mindre en
+  IP-literal i allowlisten eller trusted-settet slipper dem. Uten `--net` er
+  bare modellendepunktet åpent. Hostens tjenester nås bare via
+  trusted-portene (modellport, `--net host:PORT`).
+- **Filsystem:** agenten skriver bare i `/work` (som standard en overlay:
+  workdir på hosten røres ikke, se [Workdir](#workdir---work)), `/out`
+  (med `--work ro`/`none`) og sin økts HOME
   (`.sandbox/agent-home/<usecase>/<basename>-<hash>/<økt>`); rotfilsystemet
   er read-only. En ny økt starter med tom HOME, så tidligere økter påvirker
   den ikke; `--resume` gjenbruker en økt eksplisitt (se
@@ -51,18 +57,19 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
 
 **Det harrbjorn ikke beskytter mot:**
 
-- **Kode agenten legger i workdir.** Uten `--overlay` skriver agenten rett
-  i workdir, og hosten kjører senere det som ligger der: `Makefile`,
-  `package.json`-scripts, `.envrc`, IDE-oppgaver, pre-commit-hooks. Bruk
-  `--overlay` for upålitelige kjøringer, og les patchen før du bruker den.
-- **`.git` utenfor den beskyttede katalogen.** Bare en eksisterende
-  `.git`-katalog øverst i workdir monteres read-only. En `.git` agenten
+- **Kode agenten legger i workdir.** Hosten kjører senere det som ligger
+  der: `Makefile`, `package.json`-scripts, `.envrc`, IDE-oppgaver,
+  pre-commit-hooks. I overlay-modus (default) kommer det som en patch du
+  må lese før du bruker den; med `--work rw` skriver agenten rett i workdir.
+- **`.git` utenfor den beskyttede katalogen (`--work rw`).** Bare en
+  eksisterende `.git`-katalog øverst i workdir monteres read-only. En `.git` agenten
   lager (også i underkataloger, eller når workdir ikke er et repo), og en
   `.git`-fil (worktree/submodul), er skrivbar — git på hosten kjører det
   som plantes der (`core.fsmonitor`, hooks), f.eks. ved neste `git status`.
 - **Exfiltrering via tillatte mål.** Allowlisten er ikke exfil-vern: GitHub
   (push/gist med egen token), LLM-API-er (med egen nøkkel),
-  pakkeregistre og alle `-a`-mål kan motta data. CONNECT gir vilkårlig TCP
+  pakkeregistre og alle andre `--net`-mål kan motta data — også
+  modellendepunktet. CONNECT gir vilkårlig TCP
   til en tillatt vert på alle porter (f.eks. SSH til github.com:22), ikke
   bare HTTP(S). Modellnøkkelen er lesbar i sandboxen.
 - **Modellserveren.** Trusted-porten åpner hele tjenesten på porten, ikke
@@ -137,13 +144,14 @@ bakede spesifikatorer og låsefila tilbake; agentens egne pakker beholdes. Tille
 bygg på nytt (`--rebuild`).
 
 Porten i base-URL-en parsest ut og gjøres til en **trusted upstream** i
-proxyens policy (`SBX_PROXY_TRUSTED`) — et runtime-unntak som slår over
+proxyens policy — et runtime-unntak som slår over
 IP-filteret og DNS-rebinding-vernet for akkurat den porten, aldri en allowlistpost. Bytter du
 port på hosten, trenger bare config-fila å oppdateres.
 
 - **Sant Anthropic API**: endre hostconfigen (eller peke `SBX_CLAUDE_CONFIG`
-  et annet sted / fjerne den og sette `ANTHROPIC_API_KEY` i `.env`);
-  trafikken går via de allowlistede API-hosts.
+  et annet sted / fjerne den og sette `ANTHROPIC_API_KEY` i `.env`). Uten
+  base-URL åpnes `@anthropic` automatisk (se [Nett](#nett---net)); med en
+  ekstern base-URL åpnes hosten i den.
 - **Uten modelconfig og uten nøkkel** starter sandboxen likevel, med en
   advarsel og uten modellinnstillinger — f.eks. for bash, pi mot en annen
   leverandør eller claude med egen innlogging i økta.
@@ -177,7 +185,7 @@ kjører fordi wrapperen ble drept med SIGKILL, ryddes ikke automatisk (se
 
 Variant — ekstern proxy (`-p`): sesjonsnettet er fortsatt `--internal`.
 En per-sesjon relay (`sbx-<S>-relay`) videresender kun til den eksterne
-proxyen, modellporten og `-H`-portene, og harrbjorns proxy er den eksterne
+proxyen, modellporten og hostportene, og harrbjorns proxy er den eksterne
 proxyens upstream: publisert på `127.0.0.1:3129`, kun på pasta-nettet, ikke
 på sesjonsnettet (se [Ekstern proxy](#ekstern-proxy--p)):
 
@@ -196,16 +204,16 @@ komponent (Smokescreen), og proxyen er ett punkt for utgangspolicyen (med
    (se [Host-isolasjon](#host-isolasjon)). Verktøy som ignorerer
    proxy-env-vars feiler trygt — også med `-p`, der relayen er eneste
    vei ut (se [Ekstern proxy](#ekstern-proxy--p)).
-2. **Proxy-utgang** — eneste utgang; begge usecases håndhever
-   host(:port)-allowlisten. Åpen utgang er allowlistposten `*` (`-a '*'`),
-   aldri en env-innstilling. Åpen modus: IP-filteret (loopback, link-local,
+2. **Proxy-utgang** — eneste utgang; allowlisten fra `--net` (pluss
+   modellendepunktet) håndheves. Åpen utgang er `--net @all`, aldri en
+   env-innstilling. Åpen modus: IP-filteret (loopback, link-local,
    private, CGNAT) og DNS-rebinding-vernet gjelder fortsatt, og alle
    beslutninger logges.
    CONNECT-tunnel for HTTPS (ingen MITM); hver beslutning (tillatt/avvist,
    med grunn) logges som JSON og lagres i `.sandbox/logs/<sesjon>.jsonl`.
 3. **Hosten er link-local** — `host.containers.internal` (169.254.1.2)
    avvises av IP-filteret, både som navn og som IP-literal i allowlisten.
-   Hostens tjenester nås via trusted-settet (modellport + `-H`), se
+   Hostens tjenester nås via trusted-settet (modellport + `host:PORT`), se
    [Host-tjenester](#host-tjenester). Unntak: hostens LAN- eller offentlige
    adresse som IP-literal, og med `-p` det den eksterne proxyen når uten å
    gå via harrbjorns proxy (upstream-regler som ikke dekker alt).
@@ -293,24 +301,20 @@ Flagg (identiske i begge):
 
 | Flag | Effekt |
 |---|---|
-| `-w DIR` | Workspace (bindmount til `/work`, rw). Default: gjeldende workdir. |
-| `-a host[:port]` | Ekstra allowlist-oppføring (kan gjentas). `-a '*'` gir åpen utgang; IP-literaler gjelder også i åpen modus (unntak fra IP-filteret). |
-| `-H port` | Tillat en host-tjeneste på angitt port (kan gjentas): `host.containers.internal:<port>` blir en trusted upstream — se [Host-tjenester](#host-tjenester). |
-| `-f FIL` | Ekstra allowlist-fil (samme format som default-allowlisten; en linje `*` gir åpen utgang). |
-| `-p host:port` | Ekstern forward-proxy (f.eks. Burp Suite; den må lytte utover loopback, se [Host-tjenester](#host-tjenester)) med harrbjorns proxy som upstream på `127.0.0.1:3129` — allowlisten gjelder. Nettet er fortsatt `--internal`, og en relay videresender kun til proxyen, modellporten og `-H`-portene. Fail-closed — se [Ekstern proxy](#ekstern-proxy--p). |
-| `--no-default-allowlist` | Allowlist-modus uten default-allowlisten: kun `-a`/`-f` og den trusted modellporten. Profil for lokal modell (LLM-API-, GitHub- og pakkeregister-hostene er exfil-kanaler). Uten virkning med `-a '*'`. |
-| `--git-rw` | Monter workdirens `.git` skrivbar. Default: en eksisterende `.git`-katalog øverst i workdir monteres read-only — se [Trusselmodell](#trusselmodell) for hva det ikke dekker. Wrapperen advarer. |
+| `-w DIR` | Workdir (`/work`, se `--work`). Default: gjeldende katalog. |
+| `--work MODE` | Hva sandboxen får av workdir: `overlay` (default; workdir urørt, endringene som patch), `ro` (read-only + skrivbar `/out`), `none` (ikke montert; `/out`), `rw` (skrivbar, `.git` read-only) eller `rw+git` (også `.git` skrivbar; wrapperen advarer). Se [Workdir](#workdir---work). |
+| `--net LISTE` | Hva økten når av nett (kan gjentas, kommaseparert): `vert`, `IP[:port]`, `host:PORT` (hosttjeneste), `@sett`, `@sti/til/fil` eller `@all` (åpen utgang). Uten `--net`: bare modellendepunktet. Se [Nett](#nett---net). |
+| `-p host:port` | Ekstern forward-proxy (f.eks. Burp Suite; den må lytte utover loopback, se [Host-tjenester](#host-tjenester)) med harrbjorns proxy som upstream på `127.0.0.1:3129` — allowlisten gjelder. Nettet er fortsatt `--internal`, og en relay videresender kun til proxyen, modellporten og hostportene. Fail-closed — se [Ekstern proxy](#ekstern-proxy--p). |
 | `--ca-cert FILE` | Ekstra CA-sertifikat (PEM/DER, kan gjentas) å stole på i bildebyggene og i sandboxen, f.eks. roten til en TLS-inspiserende mellomboks. Se [Ekstra CA](#ekstra-ca---ca-cert). |
 | `--resume[=ID]` | Gjenbruk HOME-en til sist brukte økt (eller økt `ID`) i samme workdir og usecase, som den var. Uten flagget får økten en ny, tom HOME. Se [Økter](#økter-og-resume). |
 | `--sessions` | List øktene for workdir + usecase (ID, sist brukt, størrelse) og avslutt. |
-| `--overlay` | `/work` blir en overlay: workdir på hosten (også `.git`) røres ikke under økten. Endringene kommer ut som en patch du ser over og bruker med `git apply`. Se [Overlay](#overlay---overlay). |
 | `--rebuild` | Bygg bilder + proxy på nytt (claude/pi låses ved build; se Begrensninger). |
 
 Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
 
 | Variable | Verdi | Effekt |
 |---|---|---|
-| `SBX_OPEN_NETWORK` | — | Fjernet og ignoreres (med advarsel): allowlisten håndheves alltid, åpen utgang er `-a '*'`. |
+| `SBX_OPEN_NETWORK` | — | Fjernet og ignoreres (med advarsel): nettet følger `--net`, åpen utgang er `--net @all`. |
 | `SBX_LOCALE` | `nb_NO.UTF-8` | Terminal-lokal (injectert som `LANG`). Norsk tastatur å/ø/æ i interaktiv modus. Default. |
 | | `en_US.UTF-8` | Nøytralt UTF-8-alternativ. Må være generert i bildet (se `code/Dockerfile`). |
 | `SBX_MEMORY` / `SBX_CPUS` / `SBX_PIDS` | f.eks. `4g` / `2` / `1024` | Ressursgrenser for sandboxen (wrapper-defaults i `.env.example`). |
@@ -336,30 +340,34 @@ cd ~/proj && harrbjorn code claude
 harrbjorn code -w ~/proj claude -p "Refaktoriser auth-modulen"
 harrbjorn code -w ~/proj pi -p "Refaktoriser auth-modulen"
 
+# Pakkeregistre + GitHub, og agenten skriver rett i workdir
+harrbjorn code --net @dev --work rw claude
+
+# Åpen utgang og skrivbar workdir i et annet prosjekt
+harrbjorn code -w ../grepa --net @all --work rw
+
 # Via ekstern proxy (Burp lytter på *:4321; dens CA auto-installas)
 harrbjorn code -p 127.0.0.1:4321 claude -p "Test via Burp"
 ```
 
-Eksempler — sikkerhetstesting (målene ligger IKKE i default-allowlisten,
-legges til med `-a` ved kjør):
+Eksempler — sikkerhetstesting (målene åpnes med `--net` ved kjør):
 
 ```bash
 # Interaktiv bash i gjeldende workdir (default — ingen kommando)
 harrbjorn security
 
 # agent-drevet pentest (i målets workspace; pi: samme modellkonfig som claude)
-harrbjorn security -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
+harrbjorn security -w ~/pentest --net 192.168.50.10:8080,192.168.50.10:443 \
   claude -p "Portscan og test 192.168.50.10"
-harrbjorn security -w ~/pentest -a 192.168.50.10:8080 -a 192.168.50.10:443 \
-  pi -p "Portscan og test 192.168.50.10"
+harrbjorn security -w ~/pentest --net @../scope pi -p "Test målene i scope"
 
 # direkte verktøy (HTTP-vedkommende verktøy kun — se Begrensninger)
-harrbjorn security -w ~/pentest -a 192.168.50.10:8080 curl -sI http://192.168.50.10:8080/
-harrbjorn security -w ~/pentest -a 192.168.50.10:8080 sh -c \
+harrbjorn security -w ~/pentest --net 192.168.50.10:8080 curl -sI http://192.168.50.10:8080/
+harrbjorn security -w ~/pentest --net 192.168.50.10:8080 sh -c \
   'sqlmap --proxy "$HTTP_PROXY" -u "http://192.168.50.10:8080/admin" --batch'
 
 # Via ekstern proxy (Burp med harrbjorns proxy som upstream): allowlisten gjelder
-harrbjorn security -p 127.0.0.1:4321 claude -p "Test målet via Burp"
+harrbjorn security --net @npm,target.example.com:8080 -p localhost:4321
 ```
 
 Utgress-audit:
@@ -370,30 +378,54 @@ jq . .sandbox/logs/<usecase>-<ts>-<pid>.jsonl      # etter sesjonen (også krasj
 # Smokescreen logger én JSON-linje per beslutning: mål, tillatt/avvist og grunn.
 ```
 
-## Allowlist-format
+## Nett (`--net`)
 
-Én oppføring pr. linje, `#`-kommentarer:
+Uten `--net` er bare **modellendepunktet** åpent. Det avledes av
+modelconfigen og er aldri en `--net`-post:
 
-- `host` → alle porter (Smokescreens ACL har ingen portdimensjon)
-- `host:port` → **også alle porter**; wrapperen advarer
-- `*.example.com` → subdomener av `example.com`, ikke `example.com` selv
-- `*` alene → åpen utgang: alle offentlige mål (modus, ikke et domene; IP-
-  filteret og loggingen gjelder fortsatt). Typisk `-a '*'` — siter mot
-  shell-globbing
-- `10.1.2.3` → IP-literal på alle porter (pentest-mål; private ranges tillatt)
-- `10.1.2.3:port` → kun den porten **for private/loopback/link-local IP-er**
-  (IP-filteret håndhever porten). For en offentlig IP gjelder posten alle
-  porter; wrapperen advarer. Avtalt port-scope mot offentlige mål må
-  derfor håndheves et annet sted.
+| Modelconfig | Åpent |
+|---|---|
+| lokal base-URL (`localhost`/`127.0.0.1:PORT`) | modellporten på hosten (trusted, se [Host-tjenester](#host-tjenester)) |
+| ekstern base-URL | hosten i URL-en (en IP-literal beholder porten) |
+| ingen base-URL (nøkkel, eller innlogging i økta) | `@anthropic` |
 
-To default-filer, én per usecase:
+Alt annet åpnes eksplisitt per økt med `--net LISTE` (kan gjentas,
+kommaseparert), aldri via env/`.env`:
 
-- `allowlist.code.default` — Claude Code-hosts + dev/PM-hosts (npm, pypi,
-  github, apt).
-- `allowlist.pentest.default` — kun Claude Code/LLM-hostene (bildet er
-  prebygd); pentest-mål legges alltid til med `-a`/`-f` ved kjør.
+| Post | Betyr |
+|---|---|
+| `vert` | alle porter (Smokescreens ACL har ingen portdimensjon) |
+| `vert:port` | **også alle porter**; wrapperen advarer |
+| `*.example.com` | subdomener av `example.com`, ikke `example.com` selv |
+| `10.1.2.3` | IP-literal på alle porter (pentest-mål; private ranges tillatt) |
+| `10.1.2.3:port`, `[fd00::1]:port` | kun den porten **for private/loopback/link-local IP-er** (IP-filteret håndhever porten). For en offentlig IP gjelder posten alle porter, og wrapperen advarer; avtalt port-scope mot offentlige mål må håndheves et annet sted. |
+| `host:PORT` | hosttjeneste på `host.containers.internal:PORT`, se [Host-tjenester](#host-tjenester) |
+| `@navn` | sett: `~/.config/harrbjorn/net/<navn>`, ellers `net/<navn>` i repoet |
+| `@sti/til/fil` | sett fra fil (posten inneholder `/`; relativ til gjeldende katalog) |
+| `@all` | åpen utgang: alle offentlige mål (IP-filteret og loggingen gjelder fortsatt); kan bare kombineres med `host:PORT` |
 
-`-a` og `-f` slås sammen med default-fila til en per-sesjon-allowlisten
+Settene i `net/`:
+
+| Sett | Innhold |
+|---|---|
+| `@anthropic` | Claude Code: API-et, innlogging og CLI-infrastruktur |
+| `@github` | `github.com`, API, arkiver, rå filer, release-nedlastinger |
+| `@npm` | `registry.npmjs.org` |
+| `@pypi` | `pypi.org`, `files.pythonhosted.org` |
+| `@maven` | Maven Central |
+| `@debian` | Debian-speilene (apt) |
+| `@dev` | `@github @npm @pypi @maven @debian` — ikke `@anthropic`, modellen er åpen uansett |
+
+En settfil har én eller flere poster per linje (`#`-kommentarer) og kan
+inkludere andre `@navn`, men ikke `@all` eller `@sti`: det som åpnes
+utover navngitte sett, står på kommandolinja. Egne sett legges i
+`~/.config/harrbjorn/net/` og vinner over repoets med samme navn; hvilken
+fil som ble brukt, logges ved start. **Ingen settfil kan ligge i workdir**
+(heller ikke via symlenke): agenten skriver der og kunne utvidet neste økt.
+Legg scope-fila for en pentest ved siden av workdir, f.eks. `--net
+@../scope`.
+
+Postene slås sammen til en per-sesjon-allowlist
 (`.sandbox/allowlist-<S>.txt`), så samtidige sesjoner ikke deler en fil.
 
 IP-filter og DNS-rebinding-vern (Smokescreen): proxyen resolver navnet selv
@@ -409,18 +441,18 @@ hoppes over med advarsel) — host-tjenester kun via trusted-settet
 
 ## Host-tjenester
 
-Sandboxen kan nå spesifikke tjenester på selve hosten (her: OpenAI-kompatibel
-modellserver) — men kun via `host.containers.internal` (podmans pasta-
+Sandboxen kan nå spesifikke tjenester på selve hosten (her: en modellserver
+med Anthropic-API-et) — men kun via `host.containers.internal` (podmans pasta-
 hostadresse, 169.254.1.2) og kun via proxyens **trusted-sett**:
 
 1. **Modellserveren** legges til automatisk: porten parsest fra
    modelconfigens `ANTHROPIC_BASE_URL` (se ovenfor).
 2. **Andre host-tjenester** (testinstanser på hosten) legges til eksplisitt,
-   port for port, med `-H`: `harrbjorn code -w ~/proj -H 8080 -H 9443 claude ...`.
+   port for port, med `host:PORT`: `harrbjorn code -w ~/proj --net host:8080,host:9443 claude ...`.
    Hver port blir en trusted upstream for `host.containers.internal:<port>` —
    et eksplisitt, port-for-port-runtime-unntak, aldri en allowlistpost.
    Hosten er link-local, så IP-filteret og DNS-rebinding-vernet avslår den
-   uansett hva allowlisten (eller open-modus) sier: `-H` er veien til
+   uansett hva allowlisten (eller open-modus) sier: `host:PORT` er veien til
    host-tjenester, i begge moduser (se [Trusselmodell](#trusselmodell) om
    hostens andre adresser).
 
@@ -429,7 +461,7 @@ Merk: tjenester på hosten må lytte på et grensesnitt utover loopback
 `host.containers.internal` til hostens primæradresse. **Da er de også
 nåbare fra LAN-et** med mindre brannmuren stopper det — Fedora
 Workstations default-sone (`FedoraWorkstation`) slipper inn 1025–65535.
-En modellserver, `-H`-tjeneste eller Burp-listener (`-p`) på `*:<port>`
+En modellserver, hosttjeneste eller Burp-listener (`-p`) på `*:<port>`
 er dermed åpen for alle på samme nett (Burp: en åpen proxy inn til alt
 hosten når, inkl. VPN). Steng porten mot eksterne grensesnitt, f.eks. med
 en firewalld-regel som kun slipper til lokale kilder, eller bind tjenesten
@@ -468,15 +500,15 @@ gjerne et eget Burp-prosjekt for agentøkter.
   avhenge av dem. En per-sesjon **relay** (`harrbjorn/sbx-relay`, socat,
   read-only, uid 65534 — root i gjesten under krun, se lag 5) på internal-nettet + pasta-nettet er sandboxens
   eneste vei ut, og videresender kun faste porter: den eksterne proxyen,
-  modellporten og `-H`-portene. Agenten når ingenting annet direkte —
+  modellporten og hostportene. Agenten når ingenting annet direkte —
   verken internett, LAN eller andre host-porter.
 - **Allowlisten gjelder** — Burp sender videre til harrbjorns proxy, som
   slår opp og kobler til målet selv: ACL, IP-filter og audit-logg gjelder
-  som uten `-p` (`-a`, `-f`, `-a '*'`, `--no-default-allowlist`), og Burps
+  som uten `-p` (`--net`, også `@all`), og Burps
   egne DNS-oppslag spiller ingen rolle. Proxyen er publisert kun på
   hostens `127.0.0.1` (ikke LAN) og sitter ikke på sesjonsnettet, så
   sandboxen når den bare gjennom Burp. Trafikk til modellporten og
-  `-H`-portene går direkte gjennom relayen og logges ikke.
+  hostportene går direkte gjennom relayen og logges ikke.
 - **Fail-closed** — før noe sesjonsressurs lages, TCP-prober wrapperen
   `host:port` fra hosten (timeout 5 s). Svarer ingenting: hard feil,
   sesjonen startes ikke — ingen fallback. Før sandboxen startes sender
@@ -486,9 +518,9 @@ gjerne et eget Burp-prosjekt for agentøkter.
   upstream-regler som bare dekker noen verter.
 - **Host-tjenester via relayen** — i sandboxen peker
   `host.containers.internal` på relayen (`--add-host`) og står i
-  `NO_PROXY`, så modellserveren og `-H`-tjenester nås på samme URL som
+  `NO_PROXY`, så modellserveren og hosttjenester nås på samme URL som
   ellers, direkte gjennom relayen og ikke via den eksterne proxyen (som
-  kjører på hosten og ikke kan løse navnet). En `-H`-port lik proxyens
+  kjører på hosten og ikke kan løse navnet). En hostport lik proxyens
   port avvises hvis proxyen ikke selv ligger på hosten.
 - **Burp CA auto-installas** — svarer proxyen med et parsbart
   X.509-sertifikat på `http://<proxy>/cert` (Burp Suites selvsignerte CA),
@@ -503,7 +535,7 @@ gjerne et eget Burp-prosjekt for agentøkter.
   relayen når (ikke bare `127.0.0.1`), se [Host-tjenester](#host-tjenester).
 
 ```bash
-# Burp lytter på *:4321, upstream 127.0.0.1:3129 (målene i allowlisten med -a):
+# Burp lytter på *:4321, upstream 127.0.0.1:3129 (målene med --net):
 harrbjorn code -p 127.0.0.1:4321 claude -p "Test via Burp"
 harrbjorn security -p 127.0.0.1:4321 claude -p "Test målet via Burp"
 ```
@@ -532,14 +564,48 @@ harrbjorn code --resume=code-1795694761-1318814 pi -r
 - Resume tar med alt økta hadde, også det et mål eventuelt plantet
   (prompt injection i samtalen, hooks, verktøy). Det er det eksplisitte
   valget; en ny økt er ren.
-- Workdir (`/work`) er ikke en del av økta: endringer der (f.eks.
-  prosjektets `.claude/settings.json` eller `CLAUDE.md`) ser også neste nye
-  økt. Bruk `--overlay` for å holde workdir urørt.
+- Capabilities arves ikke: hver kjøring får dem fra sin egen kommandolinje
+  (`--net`, `--work`). Hva en HOME har hatt (unionen over øktene som har
+  brukt den), lagres på hosten ved siden av øktene (`.<ID>.caps`). Gir en
+  `--resume` HOME-en mer enn det, f.eks. en HOME fra `--net @all`
+  gjenopptatt med `--work rw`, advarer wrapperen før noe startes og
+  lister utvidelsene (`work rw`, `@all`, `host:PORT`, nye poster). Etter
+  `@all` regnes navn som dekket, IP-literaler ikke (private adresser er
+  stengt også i åpen modus). Økter fra før dette ble lagret, gir en egen
+  advarsel ved første resume.
+- Workdir (`/work`) er ikke en del av økta: med `--work rw` ser også neste
+  nye økt endringer der (f.eks. prosjektets `.claude/settings.json` eller
+  `CLAUDE.md`). I overlay-modus (default) når de workdir bare når du
+  bruker patchen.
 - Økter fra før denne ordningen ligger på den gamle stien og vises ikke.
 
-## Overlay (`--overlay`)
+## Workdir (`--work`)
 
-Opt-in i begge usecases. `/work` monteres som en overlay over workdir med
+`--work MODE` bestemmer hva sandboxen får av workdir (`-w`, ellers
+gjeldende katalog). Workdir er alltid definert, også med `none`: den er
+nøkkelen til øktene og prosjektets identitet, og workdir-sperren gjelder i
+alle moduser.
+
+| Modus | `/work` | Ut av sandboxen |
+|---|---|---|
+| `overlay` (default) | overlay over workdir; workdir urørt | patch (`.sandbox/overlay/<sesjon>.patch`) |
+| `ro` | workdir read-only | `/out` (`.sandbox/out/<sesjon>/`) |
+| `none` | ikke montert (tom) | `/out` (`.sandbox/out/<sesjon>/`) |
+| `rw` | workdir skrivbar, eksisterende `.git` øverst read-only | direkte i workdir |
+| `rw+git` | workdir skrivbar, også `.git` (wrapperen advarer) | direkte i workdir, også hooks og git-config |
+
+Med `ro` og `none` får økten en tom, skrivbar `/out`. Etter økten skrives
+stien og innholdet ut; skrev agenten ingenting der, fjernes katalogen.
+
+```bash
+harrbjorn code claude                        # overlay
+harrbjorn code --work ro claude -p "Gå gjennom koden, skriv funnene til /out/review.md"
+harrbjorn code --work rw claude              # agenten skriver rett i workdir
+```
+
+### Overlay
+
+`/work` monteres som en overlay over workdir med
 en upperdir per sesjon (`.sandbox/overlay/<sesjon>/`). Agenten ser og
 endrer workdir som vanlig, men alle skriv havner i upperdir: workdir på
 hosten — også `.git` — røres ikke og relabeles ikke (SELinux).
@@ -556,7 +622,7 @@ som kan kjøres (f.eks. låsefiler, `*.config.js`, testfiler), og binære
 differ kan ikke leses:
 
 ```bash
-harrbjorn code --overlay claude
+harrbjorn code claude
 # …
 git -C <workdir> apply .sandbox/overlay/<sesjon>.patch
 ```
@@ -643,30 +709,30 @@ mkdir -p /tmp/sbx-test
 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   set -x
   uname -r                                                   # ≠ host-kernel (microVM; krun)
-  curl -sI https://api.anthropic.com | head -1                 # via proxy → OK
-  curl -sI https://example.com | head -1                       # → OK (åpen utgang som standard)
+  curl -sI https://api.anthropic.com | head -1                 # via proxy → OK (uten base-URL: @anthropic)
+  curl -sI https://example.com | head -1                       # → avvist (ikke i --net)
   curl -s --max-time 5 http://host.containers.internal/ || true      # host port 80 → 502 (IP-filteret)
   curl -s --max-time 5 http://host.containers.internal:8000/ || true # modellserver → OK (auto-trusted)
   curl -s --max-time 5 "http://[::ffff:127.0.0.1]/" || true     # loopback → 502 (IP-filteret)
   echo x > /etc/test || true                            # → Read-only file system
-  echo x > /work/test && stat -c "%U" /work/test         # OK, eies av hostbrukeren (keep-id)
+  echo x > /work/test && stat -c "%U" /work/test         # OK, i overlayen (patch etterpå)
 '
 podman logs "$(podman ps --filter name=sbx- --format '{{.Names}}' | grep -m1 proxy)" | tail
 # én JSON-linje per beslutning: api.anthropic.com:443 tillatt,
 # host.containers.internal:80 avvist (link-local, ikke trusted)
 
-# -H: eksplisitt host-port (annen port enn modellserveren)
-./run-code.sh -w /tmp/sbx-test -H 9443 -- sh -c '
+# host:PORT: eksplisitt host-port (annen port enn modellserveren)
+./run-code.sh -w /tmp/sbx-test --net host:9443 -- sh -c '
   curl -s --max-time 5 http://host.containers.internal:9443/ || true   # OK hvis hosten lytter
-  curl -s --max-time 5 http://host.containers.internal:8080/ || true   # 502 (ikke -H-et)
+  curl -s --max-time 5 http://host.containers.internal:8080/ || true   # 502 (ikke åpnet)
 '
 
-# Allowlist (default) og åpen utgang for kodeagent
-./run-code.sh -w /tmp/sbx-test -- sh -c '
-  curl -sI https://api.anthropic.com | head -1   # → OK (i allowlist.code.default)
-  curl -sI https://example.com | head -1         # → avvises (ikke i allowlisten)
+# Sett og åpen utgang
+./run-code.sh -w /tmp/sbx-test --net @pypi -- sh -c '
+  curl -sI https://pypi.org | head -1            # → OK (@pypi)
+  curl -sI https://github.com | head -1          # → avvises (ikke i --net)
 '
-./run-code.sh -w /tmp/sbx-test -a '*' -- curl -sI https://example.com   # → OK (åpen utgang)
+./run-code.sh -w /tmp/sbx-test --net @all -- curl -sI https://example.com   # → OK (åpen utgang)
 
 # Valgt runtime mangler → hard feil, ingen stille fallback til crun
 SBX_RUNTIME=runsc ./run-code.sh -w /tmp/sbx-test -- sh -c 'true' 2>&1 \
@@ -689,21 +755,21 @@ SBX_RUNTIME=runsc ./run-code.sh -w /tmp/sbx-test -- sh -c 'true' 2>&1 \
   | grep -F 'canary never arrived'                       # → match
 
 # -p: working path (Burp lytter på *:4321, upstream 127.0.0.1:3129)
-./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:4321 -a example.com -- sh -c '
+./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:4321 --net example.com -- sh -c '
   echo "$HTTP_PROXY"                     # → http://sbx-<S>-relay:4321
   ls -l ~/.sbx-ca-bundle.pem 2>/dev/null # → 0600, system-CAs + Burp CA
-  curl -sI https://example.com | head -1 # → OK (TLS via Burp CA; -a)
+  curl -sI https://example.com | head -1 # → OK (TLS via Burp CA; --net)
   curl -sI https://example.org | head -1 # → avvist av harrbjorns proxy
 '
 ```
 
-Pentest-variant (mål i allowlisten via `-a`, dev-hosts skal være borte):
+Pentest-variant (målet via `--net`, ingenting annet):
 
 ```bash
-./run-pentest.sh -w /tmp/sbx-test -a example.com -- sh -c '
-  curl -sI https://example.com | head -1   # → OK (-a tillatt)
-  curl -sI https://pypi.org | head -1      # → avvises (dev-hosts borte i pentest-default)
-  curl -s --max-time 5 http://10.0.0.1/ || true   # → 502 (RFC1918-mål uten -a)
+./run-pentest.sh -w /tmp/sbx-test --net example.com -- sh -c '
+  curl -sI https://example.com | head -1   # → OK (--net)
+  curl -sI https://pypi.org | head -1      # → avvises (ikke i --net)
+  curl -s --max-time 5 http://10.0.0.1/ || true   # → 502 (RFC1918-mål uten --net)
 '
 podman logs "$(podman ps --filter name=sbx- --format '{{.Names}}' | grep -m1 proxy)" | tail
 ```
@@ -733,13 +799,13 @@ mkdir -p /tmp/sbx-a
 - Utgang er **proxy-kun**, ikke «proxy-fremst»: rå TCP uten proxy
   feiler trygt (ingen route), også med `-p` (relayen videresender kun
   faste porter). Med `-p` gjelder audit-loggen også (harrbjorns proxy er
-  Burps upstream), unntatt trafikken til modellporten og `-H`-portene,
+  Burps upstream), unntatt trafikken til modellporten og hostportene,
   som går direkte gjennom relayen. Audit-loggen
   registrerer beslutninger (mål, tillatt/avvist, grunn), ikke innhold.
-- Åpen utgang (`-a '*'`) er et bevisst valg per økt: alle beslutninger
+- Åpen utgang (`--net @all`) er et bevisst valg per økt: alle beslutninger
   logges fortsatt, og IP-filteret (loopback, link-local, private, CGNAT),
   DNS-rebinding-vernet og container-hardening holder likevel. Det er ikke
-  exfil-vern — det er heller ikke default-allowlistene.
+  exfil-vern — det er heller ikke settene.
 - Proxy-utgang betyr at **HTTP-vedkommende verktøy** i pentest-sandboxen er
   de som når målene: curl, python, git m.fl. bruker
   `HTTP(S)_PROXY`-env-vars automatisk. **sqlmap** må få proxyen eksplisitt:
@@ -779,7 +845,8 @@ mkdir -p /tmp/sbx-a
 - Bindmounts får `:z` (SELinux-relabel) — nødvendig på SELinux-hosts
   (f.eks. Fedora) for mounter fra home-direkter. Det relabeler workdir og
   økt-HOME varig til en delt containerlabel (ingen SELinux-separasjon
-  mellom økter); med `--overlay` relabeles ikke workdir.
+  mellom økter); med `--work overlay` (default) og `none` relabeles ikke
+  workdir.
 - krun-microVM-er (default-runtime): ~90 MB minne per VM (sandbox + proxy)
   og oppstarts-tak i sekunder; bindmounter går via virtio-fs.
   `SBX_RUNTIME=crun` (eksplisitt) fjerner VM-laget — en container-escape

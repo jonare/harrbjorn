@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/test-overlay.sh — --overlay: patchen som lages etter økten
+# tests/test-overlay.sh — --work overlay: patchen som lages etter økten
 # (lib/overlay-diff.sh) og sammendraget på hosten (sbx_overlay_report).
 #
 # overlay-diff.sh kjøres i produksjon i en nettløs hjelpecontainer med

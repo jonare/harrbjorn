@@ -1,0 +1,7 @@
+# @dev — dev tooling: source hosting and package registries. Not the
+# model: its endpoint is always open (see README, «Nett»).
+@github
+@npm
+@pypi
+@maven
+@debian

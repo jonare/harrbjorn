@@ -1,0 +1,3 @@
+# @debian — Debian package mirrors (apt).
+deb.debian.org
+security.debian.org

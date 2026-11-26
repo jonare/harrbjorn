@@ -2,7 +2,7 @@
 # lib/overlay-diff.sh LOWER MERGED OUT — write a binary-safe git patch of
 # MERGED relative to LOWER to OUT (empty when nothing changed).
 #
-# Run by harrbjorn after an --overlay session, in a networkless helper
+# Run by harrbjorn after an overlay session (--work overlay), in a networkless helper
 # container: LOWER is the untouched workdir, MERGED the workdir as the
 # agent left it. MERGED is agent-controlled, so nothing in it configures
 # git: a private GIT_DIR (the workdir's .git is never read), no system or

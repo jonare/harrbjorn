@@ -27,6 +27,7 @@ RUN --mount=type=secret,id=sbx_ca \
         python3-dev \
         openssl \
         ripgrep \
+        fd-find \
         file \
         vim \
         less \
