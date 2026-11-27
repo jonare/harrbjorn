@@ -130,41 +130,21 @@ sbx_reap_orphans() {
 
 image_exists() { $PODMAN image inspect "$1" >/dev/null 2>&1; }
 
-# ------------------------------------------------------------ model config
-# Names injected from the model config: model/endpoint settings only.
-# Anything else the file exports (tokens for other services, ...) stays on
-# the host. Shell noise that `env -i sh` adds by itself is dropped silently.
-SBX_MODEL_ENV_RE='^(ANTHROPIC_[A-Z0-9_]*|CLAUDE_[A-Z0-9_]*|MAX_THINKING_TOKENS|MAX_MCP_OUTPUT_TOKENS|API_TIMEOUT_MS|BASH_DEFAULT_TIMEOUT_MS|BASH_MAX_TIMEOUT_MS|DISABLE_[A-Z0-9_]*)$'
-SBX_SHELL_NOISE_RE='^(PWD|OLDPWD|SHLVL|_)$'
+# ------------------------------------------------------------ model (pi)
+# The model comes from env/.env, never from the repo (it is public):
+# SBX_MODEL_BASE_URL (OpenAI-compatible, e.g. vLLM's .../v1), SBX_MODEL,
+# SBX_MODEL_API_KEY and optional SBX_MODEL_CONTEXT_WINDOW /
+# SBX_MODEL_MAX_TOKENS. sbx-init.sh writes pi's models.json from them.
+SBX_MODEL_VARS=(SBX_MODEL SBX_MODEL_API_KEY SBX_MODEL_CONTEXT_WINDOW SBX_MODEL_MAX_TOKENS)
 
-# sbx_model_env FILE — evaluate FILE's `export` lines in a clean shell and
-# print the model variables as NUL-terminated NAME=VALUE records (values may
-# contain newlines). A loopback ANTHROPIC_BASE_URL is pointed at the host
-# via host.containers.internal (pasta's host address). Other names are
-# dropped with a warning that names them — never their values. POSIX sh
-# only inside: /bin/sh is dash on Debian-family hosts.
-sbx_model_env() {
-  local exports rec name dropped=()
-  exports="$(grep -E '^export[[:space:]]' "$1" || true)"
-  while IFS= read -r -d '' rec; do
-    name="${rec%%=*}"
-    if [[ "$name" =~ $SBX_MODEL_ENV_RE ]]; then
-      printf '%s\0' "$rec"
-    elif [[ ! "$name" =~ $SBX_SHELL_NOISE_RE ]]; then
-      dropped+=("$name")
-    fi
-  done < <(env -i sh -c '
-      eval "$1"
-      case "${ANTHROPIC_BASE_URL:-}" in
-        http://localhost:*) ANTHROPIC_BASE_URL="http://host.containers.internal:${ANTHROPIC_BASE_URL#http://localhost:}" ;;
-        http://127.0.0.1:*) ANTHROPIC_BASE_URL="http://host.containers.internal:${ANTHROPIC_BASE_URL#http://127.0.0.1:}" ;;
-      esac
-      [ -n "${ANTHROPIC_BASE_URL:-}" ] && export ANTHROPIC_BASE_URL
-      env -0' sh "$exports" | LC_ALL=C sort -z)
-  if (( ${#dropped[@]} )); then
-    echo "warn: model config $1: not injected (not model settings): ${dropped[*]}" >&2
-  fi
-  return 0
+# sbx_model_url URL — URL as the sandbox sees it: a loopback http URL is
+# pointed at the host via host.containers.internal (pasta's host address).
+sbx_model_url() {
+  case "$1" in
+    http://localhost:*) echo "http://host.containers.internal:${1#http://localhost:}" ;;
+    http://127.0.0.1:*) echo "http://host.containers.internal:${1#http://127.0.0.1:}" ;;
+    *) echo "$1" ;;
+  esac
 }
 
 # sbx_trusted_model_port URL — print URL's port when URL points at the host
@@ -184,18 +164,16 @@ sbx_trusted_model_port() {
 # _sbx_under A B — true if path A is B or lies below it.
 _sbx_under() { [[ "$2" == / || "$1" == "$2" || "$1" == "$2"/* ]]; }
 
-# sbx_check_workdir WORKDIR HOME_DIR REPO_DIR [PROTECTED_FILE...] — refuse a
-# workdir that would give the sandbox (read or, with --work rw, write)
-# access to something the host runs or trusts: /, $HOME or a parent of it, the harrbjorn repo (lib/, .env,
-# .sandbox/ with other sessions' HOMEs and audit logs) or anything above or
-# inside it, and any directory containing a protected file (the model
-# config is eval'ed on the host). Compared on physical paths.
+# sbx_check_workdir WORKDIR HOME_DIR REPO_DIR — refuse a workdir that would
+# give the sandbox (read or, with --work rw, write) access to something the
+# host runs or trusts: /, $HOME or a parent of it, the harrbjorn repo (lib/,
+# .env with the model key, .sandbox/ with other sessions' HOMEs and audit
+# logs) or anything above or inside it. Compared on physical paths.
 sbx_check_workdir() {
-  local wd home repo f fr
+  local wd home repo
   wd="$(realpath -m -- "$1")"
   home="$(realpath -m -- "$2")"
   repo="$(realpath -m -- "$3")"
-  shift 3
   local why=""
   if [[ "$wd" == / ]]; then
     why="it is the filesystem root"
@@ -205,15 +183,6 @@ sbx_check_workdir() {
     why="it contains the harrbjorn repo ($repo)"
   elif _sbx_under "$wd" "$repo"; then
     why="it is inside the harrbjorn repo ($repo)"
-  else
-    for f in "$@"; do
-      [[ -e "$f" ]] || continue
-      fr="$(realpath -m -- "$f")"
-      if _sbx_under "$fr" "$wd"; then
-        why="it contains $f, which the host evaluates"
-        break
-      fi
-    done
   fi
   if [[ -n "$why" ]]; then
     echo "error: refusing workdir $1: $why. The workdir is the sandbox's view of the host (and writable with --work rw); pick a project directory instead." >&2
@@ -577,6 +546,36 @@ sbx_url_host() {
   if [[ "$hp" =~ ^\[(.*)\]$ ]]; then echo "${BASH_REMATCH[1]}"
   elif [[ "$hp" =~ ^\[.*\]:[0-9]+$ || "$hp" =~ ^[0-9.]+(:[0-9]+)?$ ]]; then echo "$hp"
   else echo "${hp%:*}"; fi
+}
+
+# sbx_url_port URL — URL's explicit port, else its scheme's (https 443,
+# http 80).
+sbx_url_port() {
+  local hp="${1#*://}"
+  hp="${hp%%[/?#]*}"; hp="${hp##*@}"
+  if [[ "$hp" =~ :([0-9]+)$ ]]; then echo "${BASH_REMATCH[1]}"
+  elif [[ "$1" == https://* ]]; then echo 443
+  else echo 80; fi
+}
+
+# _sbx_resolve NAME — the addresses NAME resolves to on the host, one per
+# line (nothing if it does not resolve).
+_sbx_resolve() { getent ahosts "$1" 2>/dev/null | awk '!seen[$1]++ { print $1 }'; }
+
+# sbx_private_addrs NAME — the private addresses (RFC 1918, CGNAT, ULA)
+# NAME resolves to. Smokescreen's IP filter denies those whatever the ACL
+# says, so a model server on an internal name needs them as port-scoped
+# exceptions. Never loopback or link-local: the proxy itself, the host
+# (169.254.1.2, only through its trusted ports) and cloud metadata.
+sbx_private_addrs() {
+  _sbx_resolve "$1" | python3 -c '
+import ipaddress, sys
+nets = [ipaddress.ip_network(n) for n in
+        ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7")]
+for line in sys.stdin:
+    try: ip = ipaddress.ip_address(line.strip())
+    except ValueError: continue
+    if any(ip.version == n.version and ip in n for n in nets): print(ip)'
 }
 
 # ------------------------------------------------------------ proxy policy
@@ -1281,23 +1280,10 @@ sbx_main() {
     echo ">> extra CA: $(grep -c -- '-----BEGIN CERTIFICATE-----' <<< "$CA_PEM") certificate(s) from ${CA_FILES[*]}"
   fi
 
-  # ----------------------------------------------- model config (injection)
-  # The sandbox reuses the host's Claude Code model setup (SBX_CLAUDE_CONFIG,
-  # default ~/claude.sh) — same model, effort, context window and key — with
-  # one rewrite: a loopback ANTHROPIC_BASE_URL is pointed at the host through
-  # host.containers.internal (pasta host address) instead of localhost. The
-  # host address is a *trusted* proxy upstream (PROXY_TRUSTED below) —
-  # it is a runtime exception, never a user allowlist entry. Only `export ...`
-  # lines are evaluated, so the file's comments and trailing `claude ...`
-  # invocation are ignored. The result is injected as env vars, standalone;
-  # no file is mounted into the container. The container's claude reads them
-  # directly; sbx-init.sh derives pi's models.json/settings.json from the
-  # same vars, so both harnesses share the model.
-  local SBX_CLAUDE_CONFIG="${SBX_CLAUDE_CONFIG:-$HOME/claude.sh}"
   # Workdir guard before anything is evaluated or created: the workdir is
   # the sandbox's view of the host (rw with --work rw), so it must not
   # contain anything the host runs or trusts. Applied in every mode.
-  sbx_check_workdir "$WORKDIR_ABS" "$HOME" "$SCRIPT_DIR" "$SBX_CLAUDE_CONFIG" || exit 1
+  sbx_check_workdir "$WORKDIR_ABS" "$HOME" "$SCRIPT_DIR" || exit 1
 
   # ------------------------------------------------------------- session
   # One HOME per session (see sbx_session_touch): without --resume the
@@ -1336,39 +1322,45 @@ sbx_main() {
     fi
     sbx_session_lock "$SESSION_BASE" "$SESSION_ID" || exit 1
   fi
+  # ------------------------------------------------------ model (pi)
+  # SBX_MODEL_* from env/.env (see SBX_MODEL_VARS), injected as env vars;
+  # sbx-init.sh writes pi's models.json/settings.json from them. A
+  # loopback base URL is pointed at the host through
+  # host.containers.internal; that port is a *trusted* proxy upstream
+  # (PROXY_TRUSTED) — a runtime exception, never a user allowlist entry.
   # Values never go on podman's command line (visible in ps): MODEL_ENV
   # holds NAME=VALUE and is exported only into the environment of the final
   # `podman run`, which gets bare `-e NAME` (podman copies the value from
   # its own environment).
-  local rec cfg_url="" cfg_port=""
-  if [[ -f "$SBX_CLAUDE_CONFIG" ]]; then
-    while IFS= read -r -d '' rec; do
-      MODEL_ENV+=("$rec")
-      [[ "$rec" == ANTHROPIC_BASE_URL=* ]] && cfg_url="${rec#*=}"
-    done < <(sbx_model_env "$SBX_CLAUDE_CONFIG")
+  local rec n cfg_url="" cfg_port=""
+  if [[ -n "${SBX_MODEL_BASE_URL:-}" ]]; then
+    cfg_url="$(sbx_model_url "$SBX_MODEL_BASE_URL")"
+    MODEL_ENV+=("SBX_MODEL_BASE_URL=$cfg_url")
+    for n in "${SBX_MODEL_VARS[@]}"; do
+      if [[ -n "${!n:-}" ]]; then MODEL_ENV+=("$n=${!n}"); fi
+    done
     cfg_port="$(sbx_trusted_model_port "$cfg_url")"
     if [[ -n "$cfg_port" ]]; then
       PROXY_TRUSTED="host.containers.internal:$cfg_port"
     fi
-    echo ">> model config: $SBX_CLAUDE_CONFIG (base_url=${cfg_url:-n/a})"
-  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
-    echo "warn: no model config at $SBX_CLAUDE_CONFIG; using ANTHROPIC_API_KEY from env/.env." >&2
-    MODEL_ENV=("ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+    echo ">> model: ${SBX_MODEL:-?} at $cfg_url"
   else
-    # No key is required: a sandbox for bash, pi against another provider or
-    # a claude with its own login works without one.
-    echo "warn: no model config at $SBX_CLAUDE_CONFIG and no ANTHROPIC_API_KEY; the agents get no model settings (log in inside the sandbox, or set SBX_CLAUDE_CONFIG)." >&2
+    # No model is required: a sandbox for bash, or pi logged in to a
+    # provider of its own (open it with --net), works without one.
+    echo "warn: no SBX_MODEL_BASE_URL (env/.env); pi gets no model settings." >&2
   fi
   for rec in ${MODEL_ENV[@]+"${MODEL_ENV[@]}"}; do
     CONFIG_ENV+=(-e "${rec%%=*}")
   done
 
   # ------------------------------------------- model endpoint (implicit)
-  # Always open, derived from the model config, never a --net item: a local
-  # model server is a trusted host port (above); a remote base URL opens
-  # its host; no base URL (Claude Code with a key, or its own login in the
-  # session) opens @anthropic. Moot with @all.
-  local model_net="" net_desc
+  # Always open, derived from SBX_MODEL_BASE_URL, never a --net item: a
+  # local model server is a trusted host port (above); a remote base URL
+  # opens its host. A name on private addresses (an internal model server
+  # over https) also gets those addresses, port-scoped to the model port:
+  # Smokescreen's IP filter denies them whatever the ACL says. No base URL
+  # opens nothing. Moot with @all.
+  local model_net="" a e
   if [[ -n "$cfg_port" ]]; then
     model_net="host.containers.internal:$cfg_port"
   elif (( OPEN_EGRESS )); then
@@ -1378,10 +1370,15 @@ sbx_main() {
     if [[ -n "$model_net" ]] && ! _sbx_has "$model_net" ${NET_ENTRIES[@]+"${NET_ENTRIES[@]}"}; then
       NET_ENTRIES+=("$model_net")
     fi
-  else
-    _sbx_net_items "$WORKDIR_ABS" @anthropic "" || exit 1
-    model_net="@anthropic"
+    if [[ -n "$model_net" && ! "$model_net" =~ ^[0-9.]+$ && "$model_net" != *:* ]]; then
+      while IFS= read -r a; do
+        if [[ "$a" == *:* ]]; then e="[$a]:$(sbx_url_port "$cfg_url")"; else e="$a:$(sbx_url_port "$cfg_url")"; fi
+        _sbx_has "$e" ${NET_ENTRIES[@]+"${NET_ENTRIES[@]}"} || NET_ENTRIES+=("$e")
+        model_net+=" $e"
+      done < <(sbx_private_addrs "$model_net")
+    fi
   fi
+  local net_desc
   net_desc="${NET_ARGS[*]-}"
   echo ">> net: ${net_desc:-(model only)}; model endpoint: ${model_net:-n/a}"
   if (( ${#NET_SETS[@]} )); then echo ">> net sets: ${NET_SETS[*]}"; fi

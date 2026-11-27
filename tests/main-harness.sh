@@ -8,7 +8,8 @@
 # and provides run_main ARGS... which runs sbx_main (code usecase, crun,
 # fake podman; the caller's env passes through) in a subshell, logging
 # podman calls to $PLOG. Exit status in $MAIN_RC, stderr in $MAIN_ERR,
-# stdout in $MAIN_OUT.
+# stdout in $MAIN_OUT. Name lookups (_sbx_resolve) never hit DNS: they
+# return $FAKE_RESOLVE (space-separated addresses), empty by default.
 #
 # Helpers: plog_has PATTERN (grep -F on the podman log), sandbox_run (the
 # final `podman run` line of the sandbox container).
@@ -30,12 +31,12 @@ run_main() {
     HOME="$HH" PATH="$HB:$PATH" PODMAN="$HB/podman" FAKE_PODMAN_LOG="$PLOG" \
     SBX_RUNTIME=crun SBX_USECASE=code SBX_IMAGE=harrbjorn/code:latest \
     SBX_CONTEXT=code \
-    ANTHROPIC_API_KEY="${T_API_KEY-test-key}" \
     bash -c '
       source "$1/lib/sandbox.sh"
       sbx_usage() { exit "${1:-0}"; }
       sbx_tcp_probe() { return "${FAKE_TCP_PROBE_RC:-0}"; }
       sbx_http_probe() { return 0; }
+      _sbx_resolve() { [[ -z "${FAKE_RESOLVE:-}" ]] || printf "%s\n" $FAKE_RESOLVE; }
       sbx_burp_chained() { echo "burp-chained $*" >> "$FAKE_PODMAN_LOG"; return "${FAKE_BURP_CHAINED_RC:-0}"; }
       shift; sbx_main "$@"
     ' _ "$HR" "$@" 2>&1 >"$T_TMP/main.out"

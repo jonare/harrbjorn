@@ -23,16 +23,21 @@ assert_eq "nofile: lavere hard-grense brukes"     16384 "$(bash -c 'source "$1/l
 assert_match "nofile: sandboxen innenfor hostens grense" ' --ulimit nofile=2048:2048 ' "$(sandbox_run)"
 assert_match "nofile: proxyen innenfor hostens grense"   ' --ulimit nofile=2048:2048 ' "$(grep 'harrbjorn/sbx-proxy:latest' "$PLOG")"
 
-# Uten modelconfig og uten ANTHROPIC_API_KEY starter sandboxen likevel
-# (bash, pi mot en annen leverandør, claude med egen innlogging): bare en
-# advarsel. Finnes nøkkelen i env/.env, sendes den videre som før.
-T_API_KEY= run_main true
-assert_eq       "uten nøkkel: exit 0"                0 "$MAIN_RC"
-assert_match    "uten nøkkel: advarsel"              'no model config.*no ANTHROPIC_API_KEY' "$MAIN_ERR"
-assert_no_match "uten nøkkel: ingen ANTHROPIC_API_KEY til sandboxen" '-e ANTHROPIC_API_KEY' "$(sandbox_run)"
-assert_match    "uten nøkkel: sandboxen kjøres"      'harrbjorn/code:latest true$' "$(sandbox_run)"
+# Uten modell (SBX_MODEL_BASE_URL) starter sandboxen likevel (bash, pi
+# mot en leverandør agenten selv logger inn hos): bare en advarsel, og
+# ingen modellvariabler sendes inn. Ingen Anthropic-variabler i noe tilfelle.
 run_main true
-assert_match    "med nøkkel i env: sendes videre"    ' -e ANTHROPIC_API_KEY ' "$(sandbox_run)"
+assert_eq       "uten modell: exit 0"                0 "$MAIN_RC"
+assert_match    "uten modell: advarsel"              'no SBX_MODEL_BASE_URL' "$MAIN_ERR"
+assert_no_match "uten modell: ingen modellvariabler" '-e SBX_MODEL' "$(sandbox_run)"
+assert_match    "uten modell: sandboxen kjøres"      'harrbjorn/code:latest true$' "$(sandbox_run)"
+SBX_MODEL_BASE_URL=https://llm.example.net/v1 SBX_MODEL=m SBX_MODEL_API_KEY=k \
+SBX_MODEL_CONTEXT_WINDOW=65536 SBX_MODEL_MAX_TOKENS=8192 ANTHROPIC_API_KEY=a run_main true
+for v in SBX_MODEL_BASE_URL SBX_MODEL SBX_MODEL_API_KEY SBX_MODEL_CONTEXT_WINDOW SBX_MODEL_MAX_TOKENS; do
+  assert_match  "med modell: -e $v"                  " -e $v " "$(sandbox_run)"
+done
+assert_no_match "med modell: ingen ANTHROPIC_*"      '-e ANTHROPIC_' "$(sandbox_run)"
+assert_match    "med modell: logges"                 '>> model: m at https://llm\.example\.net/v1' "$MAIN_OUT"
 
 # Readiness-proben (sbx_wait_tcp) bruker rå /dev/tcp. Den skal kjøre i samme
 # runtime som sandboxen: under krun skjer socket-bruken inne i gjesten, ikke
@@ -132,7 +137,7 @@ done
 # den bare gjennom Burp. Trusted host-porter går via relayen, aldri via
 # Smokescreen. Før sandboxen starter sjekkes det at Burp faktisk sender
 # videre til Smokescreen (kanari); ellers fail-closed.
-printf 'export ANTHROPIC_BASE_URL=http://localhost:8000\nexport ANTHROPIC_API_KEY=k\n' > "$HH/claude.sh"
+export SBX_MODEL_BASE_URL=http://localhost:8000
 relay_run() { grep -E '^run -d --name sbx-code-[0-9]+-[0-9]+-relay ' "$PLOG" | tail -1; }
 upstream_run() { grep -E '^run -d --name sbx-code-[0-9]+-[0-9]+-proxy ' "$PLOG" | tail -1; }
 
@@ -231,39 +236,54 @@ FAKE_BURP_CHAINED_RC=1 run_main -p 127.0.0.1:4321 true
 assert_ne    "-p: fail-closed når Burp ikke er kjedet" 0 "$MAIN_RC"
 assert_match "-p: meldingen peker på upstream-oppsettet" 'Upstream proxy servers.*127\.0\.0\.1:3129' "$MAIN_ERR"
 assert_eq    "-p: sandboxen kjøres ikke uten kjede"   "" "$(sandbox_run)"
-rm -f "$HH/claude.sh"
+unset SBX_MODEL_BASE_URL
 
 # ------------------------------------------- --net: bare modellen som default
-# Uten --net er bare modellendepunktet åpent, avledet fra modelconfigen:
-# lokal modell → trusted port; ekstern base-URL → API-hosten; ingen
-# base-URL → hele @anthropic (Claude Code med nøkkel eller innlogging).
+# Uten --net er bare modellendepunktet åpent, avledet fra
+# SBX_MODEL_BASE_URL: lokal modell → trusted port; ekstern base-URL →
+# API-hosten, og peker navnet på private adresser, åpnes de bare på
+# modellporten; ingen base-URL → ingenting (ingen implisitt @anthropic).
 # Alt annet er eksplisitt på kommandolinja: --net vert,@sett,host:PORT,@all.
 acl() { cat "$PLOG.config/acl.yaml" 2>/dev/null; }
 pyaml() { cat "$PLOG.config/proxy.yaml" 2>/dev/null; }
 acl_action() { sed -n 's/^ *action: *//p' "$PLOG.config/acl.yaml" 2>/dev/null | head -1; }
 run_main true
 assert_eq       "net: håndhevet som standard"          enforce "$(acl_action)"
-assert_match    "net: uten base-URL: @anthropic"       "'api\.anthropic\.com'" "$(acl)"
-assert_match    "net: uten base-URL: innlogging med"   "'claude\.ai'" "$(acl)"
+assert_no_match "net: uten base-URL: ingen @anthropic" 'anthropic|claude' "$(acl)"
 assert_no_match "net: ingen dev-hoster som standard"   'github|npmjs|pypi|debian' "$(acl)"
 assert_no_match "net: ingen advarsel om åpen utgang"   'open egress' "$MAIN_ERR"
+run_main --net @anthropic true
+assert_match    "net: @anthropic kan åpnes eksplisitt" "'api\.anthropic\.com'" "$(acl)"
 
-printf 'export ANTHROPIC_BASE_URL=http://localhost:8000\nexport ANTHROPIC_API_KEY=k\n' > "$HH/claude.sh"
-run_main true
+SBX_MODEL_BASE_URL=http://localhost:8000 run_main true
 assert_eq       "net: lokal modell: exit 0"            0 "$MAIN_RC"
 assert_no_match "net: lokal modell: ingen hoster"      'anthropic|claude|github|npmjs|pypi' "$(acl)"
 assert_match    "net: lokal modell: modellporten trusted" '169\.254\.1\.2:8000' "$(pyaml)"
 
-printf 'export ANTHROPIC_BASE_URL=https://LLM.example.net:8443/v1\nexport ANTHROPIC_API_KEY=k\n' > "$HH/claude.sh"
-run_main true
+SBX_MODEL_BASE_URL=https://LLM.example.net:8443/v1 run_main true
 assert_match    "net: ekstern base-URL: API-hosten"    "'llm\.example\.net'" "$(acl)"
 assert_no_match "net: ekstern base-URL: ikke @anthropic" 'anthropic|claude' "$(acl)"
 assert_no_match "net: ekstern base-URL: ingen portadvarsel" 'all ports' "$MAIN_ERR"
-printf 'export ANTHROPIC_BASE_URL=http://10.0.0.9:8000\nexport ANTHROPIC_API_KEY=k\n' > "$HH/claude.sh"
-run_main true
+assert_no_match "net: offentlig navn: ingen adresseunntak" 'allow_addresses' "$(pyaml)"
+SBX_MODEL_BASE_URL=http://10.0.0.9:8000 run_main true
 assert_match    "net: base-URL på privat IP: porten beholdes" '10\.0\.0\.9:8000' "$(pyaml)"
 
-printf 'export ANTHROPIC_BASE_URL=http://localhost:8000\nexport ANTHROPIC_API_KEY=k\n' > "$HH/claude.sh"
+# Navn på private adresser (intern modellserver over https): Smokescreen
+# avviser private adresser uansett ACL, så adressene navnet slår opp til
+# på hosten åpnes — bare på modellporten, aldri loopback/link-local.
+FAKE_RESOLVE="10.20.30.40 127.0.0.1 169.254.169.254" SBX_MODEL_BASE_URL=https://llm.example.net/v1 run_main true
+assert_eq       "net: privat navn: exit 0"             0 "$MAIN_RC"
+assert_match    "net: privat navn: navnet i ACL"       "'llm\.example\.net'" "$(acl)"
+assert_match    "net: privat navn: adressen på 443"    "'10\.20\.30\.40:443'" "$(pyaml)"
+assert_no_match "net: privat navn: ikke loopback"      '127\.0\.0\.1' "$(pyaml)"
+assert_no_match "net: privat navn: ikke metadata"      '169\.254\.169\.254' "$(pyaml)"
+assert_no_match "net: privat navn: ingen portadvarsel" 'all ports' "$MAIN_ERR"
+FAKE_RESOLVE="10.20.30.40" SBX_MODEL_BASE_URL=https://llm.example.net:8443/v1 run_main true
+assert_match    "net: privat navn: eksplisitt port"    "'10\.20\.30\.40:8443'" "$(pyaml)"
+FAKE_RESOLVE="10.20.30.40" SBX_MODEL_BASE_URL=http://llm.example.net/v1 run_main true
+assert_match    "net: privat navn: http gir 80"        "'10\.20\.30\.40:80'" "$(pyaml)"
+
+export SBX_MODEL_BASE_URL=http://localhost:8000
 run_main --net @dev true
 assert_match    "net: @dev åpner dev-hostene"          "'github\.com'.*" "$(acl | tr '\n' ' ')"
 assert_match    "net: @dev: npm"                       "'registry\.npmjs\.org'" "$(acl)"
@@ -284,7 +304,7 @@ assert_eq       "net: @all + host:PORT: åpen"          open "$(acl_action)"
 assert_match    "net: @all + host:PORT: hostporten"    '169\.254\.1\.2:9443' "$(pyaml)"
 run_main --net '*.example.org' true
 assert_eq       "net: '*.x' er bare et domene"         enforce "$(acl_action)"
-rm -f "$HH/claude.sh"
+unset SBX_MODEL_BASE_URL
 
 for bad in '*' @all,example.com @nope host:0; do
   run_main --net "$bad" true
@@ -359,10 +379,10 @@ assert_match    "økter: melding uten økter"           'no session to resume' "
 # enn den har hatt (f.eks. en HOME fra --net @all gjenopptatt med --work
 # rw), gir en advarsel som lister utvidelsene.
 rm -rf "$HBASE"
-run_main true; H1="$(home_of)"; ID1="$(basename "$H1")"
+SBX_MODEL_BASE_URL=https://llm.example.net/v1 run_main true; H1="$(home_of)"; ID1="$(basename "$H1")"
 CAPS="$(dirname "$H1")/.$ID1.caps"
 assert_eq       "caps: ny økt lagrer work"            "work overlay" "$(grep -x 'work overlay' "$CAPS" 2>/dev/null)"
-assert_eq       "caps: ny økt lagrer nett"            "net api.anthropic.com" "$(grep -x 'net api\.anthropic\.com' "$CAPS" 2>/dev/null)"
+assert_eq       "caps: ny økt lagrer nett"            "net llm.example.net" "$(grep -x 'net llm\.example\.net' "$CAPS" 2>/dev/null)"
 run_main --resume true
 assert_no_match "caps: resume med samme caps: ingen advarsel" 'capabilities' "$MAIN_ERR"
 run_main --resume --work rw --net @all,host:9443 true
