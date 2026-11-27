@@ -13,10 +13,9 @@ set -u
 python3 - <<'PYEOF' || echo "warn: failed to pre-seed agent HOME; first-run wizard will appear." >&2
 import json, os, shutil, sys
 
-# HOME is set by the wrapper (-e HOME=/home/agent); the model config arrives
-# via the same env the container's claude uses.
+# HOME is set by the wrapper (-e HOME=/home/agent); the model arrives as
+# SBX_MODEL_* env vars (from the host's env/.env).
 home = os.environ.get("HOME", "/home/agent")
-key = os.environ.get("ANTHROPIC_API_KEY", "")
 
 cj = os.path.join(home, ".claude.json")
 try:
@@ -24,16 +23,6 @@ try:
 except (FileNotFoundError, ValueError):
     d = {}
 d["hasCompletedOnboarding"] = True
-apk = d.setdefault("customApiKeyResponses", {"approved": [], "rejected": []})
-approved = apk.setdefault("approved", [])
-if key:
-    # Claude Code approves a key by its last 20 characters
-    # (key.trim().slice(-20)); never store the whole key. Drop a full key
-    # an older seeding wrote.
-    norm = key.strip()[-20:]
-    approved[:] = [a for a in approved if a != key]
-    if norm not in approved:
-        approved.append(norm)
 d.setdefault("projects", {}).setdefault("/work", {})["hasTrustDialogAccepted"] = True
 tmp = cj + ".tmp"
 with open(tmp, "w") as f: json.dump(d, f, indent=2)
@@ -55,32 +44,32 @@ s.setdefault("permissions", {}).setdefault("defaultMode", "bypassPermissions")
 with open(ss, "w") as f: json.dump(s, f, indent=2)
 
 # ------------------------------------------------------------- pi (harness)
-# pi has no ANTHROPIC_BASE_URL env var: an Anthropic-compatible endpoint must
-# be declared in $HOME/.pi/agent/models.json. Seed it from the same env the
-# container's claude uses, so both harnesses point at the same model.
+# pi's model: an OpenAI-compatible endpoint (vLLM, llama.cpp, ...) declared
+# in $HOME/.pi/agent/models.json from SBX_MODEL_*. pi sends the key as
+# `Authorization: Bearer`, which is what vLLM's --api-key checks.
 #
-# The key is referenced by env interpolation ("${ANTHROPIC_API_KEY}") and is
-# never written to disk as a literal.
-base_url = os.environ.get("ANTHROPIC_BASE_URL", "")
-model = os.environ.get("ANTHROPIC_MODEL", "")
+# The key is referenced by env interpolation ("${SBX_MODEL_API_KEY}") and is
+# never written to disk as a literal. pi needs some key to offer the model,
+# so a server without one gets a dummy.
+base_url = os.environ.get("SBX_MODEL_BASE_URL", "")
+model = os.environ.get("SBX_MODEL", "")
 if base_url and not model:
-    print(f"warn: ANTHROPIC_BASE_URL set but no ANTHROPIC_MODEL; pi gets no "
-          f"endpoint config (set ANTHROPIC_MODEL in the model config file)", file=sys.stderr)
+    print(f"warn: SBX_MODEL_BASE_URL set but no SBX_MODEL; pi gets no "
+          f"endpoint config (set SBX_MODEL in env/.env)", file=sys.stderr)
 if base_url and model:
     provider_id = "harrbjorn"
-    # Same limits claude is told about (CLAUDE_CODE_MAX_*_TOKENS from the
-    # model config); omit them and pi assumes 128k/16k on its own.
+    # Omit the limits and pi assumes 128k/16k on its own.
     entry = {
         "name": "harrbjorn model server",
         "baseUrl": base_url,
-        "api": "anthropic-messages",
-        "apiKey": "${ANTHROPIC_API_KEY}",
+        "api": "openai-completions",
+        "apiKey": "${SBX_MODEL_API_KEY}" if os.environ.get("SBX_MODEL_API_KEY") else "none",
         "models": [{"id": model}],
     }
-    m = os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "")
+    m = os.environ.get("SBX_MODEL_CONTEXT_WINDOW", "")
     if m.isdigit():
         entry["models"][0]["contextWindow"] = int(m)
-    m = os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "")
+    m = os.environ.get("SBX_MODEL_MAX_TOKENS", "")
     if m.isdigit():
         entry["models"][0]["maxTokens"] = int(m)
 
@@ -103,9 +92,8 @@ if base_url and model:
         with open(ps) as f: psd = json.load(f)
     except (FileNotFoundError, ValueError):
         psd = {}
-    # Start every run on the host-configured model, like claude does from
-    # ANTHROPIC_MODEL; a /model choice made mid-session may be overwritten
-    # on the next run by design. Other keys are merged, never replaced.
+    # Start every run on the host-configured model (SBX_MODEL); a /model
+    # choice made mid-session may be overwritten on the next run by design. Other keys are merged, never replaced.
     psd["defaultProvider"] = provider_id
     psd["defaultModel"] = model
     with open(ps, "w") as f: json.dump(psd, f, indent=2)

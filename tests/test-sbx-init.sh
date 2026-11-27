@@ -47,13 +47,37 @@ assert_eq "agentens spesifikator beholdt"  '^3.0.0' "$(spec agent-own)"
 assert_match "låsefila er den bakte"       '"from": ?"baked"' "$(cat "$ST/package-lock.json")"
 assert_match "pakkelisten i pi-settings"   'npm:pi-subagents' "$(cat "$H/.pi/agent/settings.json")"
 
-# API-nøkkelen godkjennes slik Claude Code selv lagrer det: de siste 20
-# tegnene (key.trim().slice(-20)) — aldri hele nøkkelen på disk.
-KEY="sk-ant-test-0123456789-ABCDEFGHIJKLMNOPQRST"
-HOME="$H" SBX_PI_BAKED_STORE="$B" ANTHROPIC_API_KEY="$KEY" sh "$T_REPO/code/sbx-init.sh" true 2>/dev/null
-approved() { python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1]))["customApiKeyResponses"]["approved"]))' "$H/.claude.json"; }
-assert_eq       "nøkkel: godkjent som de siste 20 tegnene" "${KEY: -20}" "$(approved)"
-assert_no_match "nøkkel: aldri hele nøkkelen i .claude.json" "sk-ant-test" "$(cat "$H/.claude.json")"
+# pi-modellen fra SBX_MODEL_*: et OpenAI-kompatibelt endepunkt (vLLM o.l.)
+# som standardmodell. Nøkkelen refereres med env-interpolering — aldri som
+# tekst på disk; uten nøkkel får pi en dummy (den krever en).
+MJ="$H/.pi/agent/models.json"; SJ="$H/.pi/agent/settings.json"
+jq_() { python3 -c 'import json,sys
+v=json.load(open(sys.argv[1]))
+for k in sys.argv[2:]: v=v[int(k)] if k.isdigit() else v[k]
+print(v)' "$@" 2>/dev/null; }
+model_init() { env HOME="$H" SBX_PI_BAKED_STORE="$B" "$@" sh "$T_REPO/code/sbx-init.sh" true 2>"$T_TMP/init.err"; }
+echo '{"providers":{"egen":{"baseUrl":"http://x"}}}' > "$MJ"
+model_init SBX_MODEL_BASE_URL=https://llm.example.net/v1 SBX_MODEL=m1 SBX_MODEL_API_KEY=sk-secret-x \
+           SBX_MODEL_CONTEXT_WINDOW=65536 SBX_MODEL_MAX_TOKENS=8192
+P=(providers harrbjorn)
+assert_eq       "pi: OpenAI-kompatibelt API"   openai-completions        "$(jq_ "$MJ" "${P[@]}" api)"
+assert_eq       "pi: base-URL"                 https://llm.example.net/v1 "$(jq_ "$MJ" "${P[@]}" baseUrl)"
+assert_eq       "pi: nøkkel via env"           '${SBX_MODEL_API_KEY}'    "$(jq_ "$MJ" "${P[@]}" apiKey)"
+assert_no_match "pi: nøkkelen ikke på disk"    'sk-secret-x'             "$(cat "$MJ" "$SJ")"
+assert_eq       "pi: modell"                   m1                        "$(jq_ "$MJ" "${P[@]}" models 0 id)"
+assert_eq       "pi: kontekstvindu"            65536                     "$(jq_ "$MJ" "${P[@]}" models 0 contextWindow)"
+assert_eq       "pi: maks output"              8192                      "$(jq_ "$MJ" "${P[@]}" models 0 maxTokens)"
+assert_eq       "pi: andre providere beholdt"  http://x                  "$(jq_ "$MJ" providers egen baseUrl)"
+assert_eq       "pi: standardprovider"         harrbjorn                 "$(jq_ "$SJ" defaultProvider)"
+assert_eq       "pi: standardmodell"           m1                        "$(jq_ "$SJ" defaultModel)"
+model_init SBX_MODEL_BASE_URL=http://host.containers.internal:8000/v1 SBX_MODEL=m2
+assert_eq       "pi: uten nøkkel: dummy"       none                      "$(jq_ "$MJ" "${P[@]}" apiKey)"
+assert_eq       "pi: uten grenser: ingen"      ""                        "$(jq_ "$MJ" "${P[@]}" models 0 contextWindow)"
+model_init SBX_MODEL_BASE_URL=https://llm.example.net/v1
+assert_match    "pi: uten modell: advarsel"    'SBX_MODEL'               "$(cat "$T_TMP/init.err")"
+rm -f "$MJ" "$SJ"
+model_init ANTHROPIC_BASE_URL=https://llm.example.net ANTHROPIC_MODEL=m3 ANTHROPIC_API_KEY=k
+assert_eq       "pi: ANTHROPIC_* brukes ikke"  ""                        "$(jq_ "$MJ" "${P[@]}" baseUrl)"
 
 # Tom HOME: første kjøring seeder alt.
 rm -rf "$H"; mkdir -p "$H"

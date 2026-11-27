@@ -11,13 +11,14 @@
 #   starts the command. With no command, an interactive bash opens in
 #   the workdir)
 #
-#   Model config: hostens Claude-config (SBX_CLAUDE_CONFIG, default
-#   ~/claude.sh) injiseres som env-vars; loopback -> host.containers.internal.
+#   Modell: pi mot et OpenAI-kompatibelt endepunkt fra SBX_MODEL_BASE_URL,
+#   SBX_MODEL og SBX_MODEL_API_KEY (env/.env), injisert som env-vars;
+#   loopback -> host.containers.internal.
 #
 #   Nett (--net LISTE, kan gjentas, kommaseparert): uten --net er bare
 #   modellendepunktet åpent — den lokale modellserveren (trusted port),
-#   hosten i en ekstern base-URL, eller @anthropic når modelconfigen ikke
-#   har base-URL. Alt annet åpnes eksplisitt per økt, aldri via env/.env
+#   eller hosten i en ekstern base-URL (et navn på private adresser får dem
+#   på modellporten). Alt annet åpnes eksplisitt per økt, aldri via env/.env
 #   (SBX_OPEN_NETWORK ignoreres):
 #     vert, *.domene, IP, IP:port, [IPv6]:port
 #              allowlistpost; porten håndheves bare for private IP-er
@@ -65,9 +66,9 @@
 #              og git på hosten kjører det som plantes der.
 #     rw+git   som rw, men også .git er skrivbar: hooks og config agenten
 #              planter, kjører når du bruker git på hosten.
-#   Workdir kan ikke være /, $HOME (eller en forelder), harrbjorn-
-#   repoet (eller over/inne i det) eller inneholde modelconfigen — heller
-#   ikke med ro/none, for workdir er nøkkelen til øktene.
+#   Workdir kan ikke være /, $HOME (eller en forelder) eller harrbjorn-
+#   repoet (eller over/inne i det, med .env) — heller ikke med ro/none,
+#   for workdir er nøkkelen til øktene.
 #
 #   Økter: hver kjøring får en ny, tom HOME (seedet fra bildet) — tidligere
 #   økter påvirker den ikke. --resume gjenbruker HOME-en til sist brukte økt

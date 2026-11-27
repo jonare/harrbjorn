@@ -31,7 +31,7 @@ uten sikkerhetstrening som gjør destruktive ting. harrbjorn begrenser hva
 en slik agent kan gjøre mot hosten og nettet.
 
 **Betrodd** (utenfor angriperens kontroll): hostbrukeren og hosten;
-modelconfigen (`export`-linjene evalueres av `sh` på hosten); modellserveren
+`.env` (sources av bash på hosten, og har modellnøkkelen); modellserveren
 og svarene dens (de styrer en agent med `bypassPermissions`); byggeinputene
 (basebilder, npm- og apt-pakker); Smokescreen, socat-relayen,
 podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
@@ -91,7 +91,7 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
   en kanal ut. Les patcher og logger med `less` eller `git apply --stat`,
   ikke `cat`.
 - **Workdir-sperren er en kort nektliste:** `/`, `$HOME` og forelderne,
-  harrbjorn-repoet og kataloger med modelconfigen. Andre kataloger (f.eks.
+  og harrbjorn-repoet (med `.env`). Andre kataloger (f.eks.
   `~/.config`, `~/.ssh`, `~/.local/bin`) godtas — velg workdir med omhu.
 - **Proxyen og relayen er ett punkt.** Kompromitteres Smokescreen eller
   socat-relayen, har angriperen reell utgang. De henger også på podmans
@@ -109,26 +109,32 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
 
 Model-backend:
 
-Sandboxen rebruker **hostens egen Claude Code-modelconfig**
-(`SBX_CLAUDE_CONFIG`, standard `~/claude.sh`) som kilde til
-modellvariabler (`ANTHROPIC_*`, `CLAUDE_*` og noen få til; andre eksporter
-i fila injiseres ikke) — samme modell, effort, kontekstvindu og nøkkel som
-på hosten. I tillegg skrives en loopback-
-`ANTHROPIC_BASE_URL` (`localhost`/`127.0.0.1`) skrives om til
-`host.containers.internal` (podmans pasta-hostadresse, 169.254.1.2), slik at
-containeren når hostens modellserver via det riktige grensesnittet. Configen
-injiseres som env-vars i containeren (standalone) — ingen fil monteres inn.
-Kun `export ...`-linjene brukes, så filens kommentarer og avsluttende
-`claude`-kommando ignoreres — men de evalueres av `sh` på hosten:
-modelconfigen er betrodd.
+Modellen er **pi** mot et OpenAI-kompatibelt endepunkt (vLLM, llama.cpp,
+…), satt med `SBX_MODEL_*` i miljøet eller `.env` — aldri i repoet:
 
-Bildets init-steg (`code/sbx-init.sh`) avleder **pi**-modellkonfigen
-(`~/.pi/agent/models.json` + `settings.json`) fra de samme env-varene, så
-begge agent-CLI-ene (claude, pi) peker på samme modellserver, nøkkel og
-modell. Nøkkelen ligger aldri som tekst i `models.json` — den refereres med
-env-interpolering (`${ANTHROPIC_API_KEY}`). Claude Codes godkjenning i
-`~/.claude.json` lagrer bare nøkkelens siste 20 tegn, slik Claude Code selv
-gjør.
+| Variabel | Innhold |
+|---|---|
+| `SBX_MODEL_BASE_URL` | Endepunktet med `/v1`, f.eks. `https://llm.example.net/v1` eller `http://localhost:8000/v1` |
+| `SBX_MODEL` | Modell-ID-en serveren bruker (vLLM: `--served-model-name`) |
+| `SBX_MODEL_API_KEY` | Nøkkelen (vLLM: `--api-key`); valgfri |
+| `SBX_MODEL_CONTEXT_WINDOW`, `SBX_MODEL_MAX_TOKENS` | Valgfrie; ellers antar pi 128k/16k |
+
+Variablene injiseres som env-vars i containeren — ingen fil monteres inn,
+og verdiene står aldri i podmans argv. En loopback-base-URL
+(`http://localhost:PORT`/`http://127.0.0.1:PORT`) skrives om til
+`host.containers.internal` (podmans pasta-hostadresse, 169.254.1.2), slik at
+containeren når hostens modellserver via det riktige grensesnittet.
+
+Bildets init-steg (`code/sbx-init.sh`) skriver pi-modellkonfigen
+(`~/.pi/agent/models.json` + `settings.json`) med `api:
+"openai-completions"` og modellen som standard. pi sender nøkkelen som
+`Authorization: Bearer`, som er det vLLMs `--api-key` sjekker. Nøkkelen
+ligger aldri som tekst i `models.json` — den refereres med env-interpolering
+(`${SBX_MODEL_API_KEY}`). vLLM må startes med `--enable-auto-tool-choice
+--tool-call-parser <parser>` for at pi skal få verktøykall.
+
+Claude Code ligger fortsatt i bildet, men får ingen modellinnstillinger:
+logg inn i økta og åpne `--net @anthropic` hvis du vil bruke den.
 
 **pi-extensions** bakes inn i bildet: `code/Dockerfile` tar env-argumentet
 `PI_EXTENSIONS` (mellomromskoddet liste av pi-pakkessilder, f.eks.
@@ -143,18 +149,17 @@ pakke agenten har endret eller byttet ut med en symlenke), og tvinger
 bakede spesifikatorer og låsefila tilbake; agentens egne pakker beholdes. Tillegg: legg til kilden i `PI_EXTENSIONS`,
 bygg på nytt (`--rebuild`).
 
-Porten i base-URL-en parsest ut og gjøres til en **trusted upstream** i
-proxyens policy — et runtime-unntak som slår over
-IP-filteret og DNS-rebinding-vernet for akkurat den porten, aldri en allowlistpost. Bytter du
-port på hosten, trenger bare config-fila å oppdateres.
+For en lokal modell parses porten i base-URL-en ut og gjøres til en
+**trusted upstream** i proxyens policy — et runtime-unntak som slår over
+IP-filteret og DNS-rebinding-vernet for akkurat den porten, aldri en
+allowlistpost. En ekstern base-URL åpner hosten i den; peker navnet på
+private adresser (en intern modellserver over https), åpnes de adressene
+navnet slår opp til på hosten ved oppstart — bare på modellporten (eksplisitt,
+ellers 443/80), aldri loopback eller link-local.
 
-- **Sant Anthropic API**: endre hostconfigen (eller peke `SBX_CLAUDE_CONFIG`
-  et annet sted / fjerne den og sette `ANTHROPIC_API_KEY` i `.env`). Uten
-  base-URL åpnes `@anthropic` automatisk (se [Nett](#nett---net)); med en
-  ekstern base-URL åpnes hosten i den.
-- **Uten modelconfig og uten nøkkel** starter sandboxen likevel, med en
-  advarsel og uten modellinnstillinger — f.eks. for bash, pi mot en annen
-  leverandør eller claude med egen innlogging i økta.
+Uten `SBX_MODEL_BASE_URL` starter sandboxen likevel, med en advarsel og uten
+modellinnstillinger — f.eks. for bash, eller pi mot en leverandør du logger
+inn hos i økta (åpne den med `--net`).
 
 Merk: model-nøkkel/base-URL er lesbare fra innsiden av sandboxen (det er et
 krav, ikke et hull) — hold ikke noe annet hemmelig i workspace-direktivet.
@@ -230,15 +235,13 @@ komponent (Smokescreen), og proxyen er ett punkt for utgangspolicyen (med
    symlenker der (f.eks. `~/.claude -> /work/...`), og en host-side seeder
    ville fulgt dem og skrevet der lenken pekte; inne i containeren når
    skrivene kun monteringer agenten allerede fullt kontrollerer.
-   Seeden setter onboarding fullført, `/work`-trust-dialog acceptert,
-   modelconfigens API-key approvet og permission-mode til `bypassPermissions`
+   Seeden setter onboarding fullført, `/work`-trust-dialog acceptert
+   og permission-mode til `bypassPermissions`
    (containernens claude kjører altså uten `--dangerously-skip-permissions`-flagg;
    gjelder KUN denne user-level-configen i agent-HOME — hostens `~/.claude`
    røres ikke), slik at first-run-vizarden ikke vises; den skriver i tillegg
-   pi-modellkonfig (`~/.pi/agent/models.json` + `settings.json`) fra de samme
-   env-varene som claude, slik at pi bruker samme modellserver/nøkkel/modell
-   (nøkkelen kun som `${ANTHROPIC_API_KEY}`-interpolering i pi-configen;
-   Claude Codes godkjenning lagrer bare de siste 20 tegnene),
+   pi-modellkonfig (`~/.pi/agent/models.json` + `settings.json`) fra
+   `SBX_MODEL_*` (nøkkelen kun som `${SBX_MODEL_API_KEY}`-interpolering),
    og kopyerer de bakede pi-extensions fra
    `/usr/local/share/pi/agent/npm` til `~/.pi/agent/npm`
    (se «Model-backend» over); pids/memory/cpu-limit.
@@ -318,7 +321,7 @@ Miljøvariabler (`env`/`.env`, vinner over wrapper-default):
 | `SBX_LOCALE` | `nb_NO.UTF-8` | Terminal-lokal (injectert som `LANG`). Norsk tastatur å/ø/æ i interaktiv modus. Default. |
 | | `en_US.UTF-8` | Nøytralt UTF-8-alternativ. Må være generert i bildet (se `code/Dockerfile`). |
 | `SBX_MEMORY` / `SBX_CPUS` / `SBX_PIDS` | f.eks. `4g` / `2` / `1024` | Ressursgrenser for sandboxen (wrapper-defaults i `.env.example`). |
-| `SBX_CLAUDE_CONFIG` | sti | Modelconfig (default `~/claude.sh`). |
+| `SBX_MODEL_BASE_URL`, `SBX_MODEL`, `SBX_MODEL_API_KEY` | URL, ID, nøkkel | pi-modellen (OpenAI-kompatibel), se «Model-backend». Valgfrie: `SBX_MODEL_CONTEXT_WINDOW`, `SBX_MODEL_MAX_TOKENS`. |
 | `SBX_RUNTIME` | `krun` | OCI-runtime for sandbox (og proxy): `krun` (microVM via KVM, default) / `runsc` (gVisor) / `crun` (eksplisitt — aldri stille fallback). Wrapperen feiler ved oppstart hvis valgt runtime (resp. `/dev/kvm` for krun) mangler. |
 | `SBX_CA_CERTS` | — | Kolonseparerte CA-filer, som `--ca-cert` (praktisk i `.env` når nettet alltid krever det). |
 | `SBX_UPSTREAM_PORT` | `3129` | Porten harrbjorns proxy publiseres på (`127.0.0.1`) som den eksterne proxyens upstream med `-p`. Fast, så upstream-oppsettet i Burp kan stå; én `-p`-sesjon om gangen per port. |
@@ -381,13 +384,13 @@ jq . .sandbox/logs/<usecase>-<ts>-<pid>.jsonl      # etter sesjonen (også krasj
 ## Nett (`--net`)
 
 Uten `--net` er bare **modellendepunktet** åpent. Det avledes av
-modelconfigen og er aldri en `--net`-post:
+`SBX_MODEL_BASE_URL` og er aldri en `--net`-post:
 
-| Modelconfig | Åpent |
+| `SBX_MODEL_BASE_URL` | Åpent |
 |---|---|
-| lokal base-URL (`localhost`/`127.0.0.1:PORT`) | modellporten på hosten (trusted, se [Host-tjenester](#host-tjenester)) |
-| ekstern base-URL | hosten i URL-en (en IP-literal beholder porten) |
-| ingen base-URL (nøkkel, eller innlogging i økta) | `@anthropic` |
+| lokal (`http://localhost`/`127.0.0.1:PORT`) | modellporten på hosten (trusted, se [Host-tjenester](#host-tjenester)) |
+| ekstern | hosten i URL-en (en IP-literal beholder porten); et navn på private adresser får dem i tillegg, bare på modellporten |
+| ikke satt | ingenting |
 
 Alt annet åpnes eksplisitt per økt med `--net LISTE` (kan gjentas,
 kommaseparert), aldri via env/`.env`:
@@ -441,12 +444,12 @@ hoppes over med advarsel) — host-tjenester kun via trusted-settet
 
 ## Host-tjenester
 
-Sandboxen kan nå spesifikke tjenester på selve hosten (her: en modellserver
-med Anthropic-API-et) — men kun via `host.containers.internal` (podmans pasta-
+Sandboxen kan nå spesifikke tjenester på selve hosten (her: en lokal
+modellserver) — men kun via `host.containers.internal` (podmans pasta-
 hostadresse, 169.254.1.2) og kun via proxyens **trusted-sett**:
 
-1. **Modellserveren** legges til automatisk: porten parsest fra
-   modelconfigens `ANTHROPIC_BASE_URL` (se ovenfor).
+1. **Modellserveren** legges til automatisk: porten parses fra en lokal
+   `SBX_MODEL_BASE_URL` (se ovenfor).
 2. **Andre host-tjenester** (testinstanser på hosten) legges til eksplisitt,
    port for port, med `host:PORT`: `harrbjorn code -w ~/proj --net host:8080,host:9443 claude ...`.
    Hver port blir en trusted upstream for `host.containers.internal:<port>` —
@@ -709,7 +712,7 @@ mkdir -p /tmp/sbx-test
 ./run-code.sh -w /tmp/sbx-test -- sh -c '
   set -x
   uname -r                                                   # ≠ host-kernel (microVM; krun)
-  curl -sI https://api.anthropic.com | head -1                 # via proxy → OK (uten base-URL: @anthropic)
+  curl -sI "$SBX_MODEL_BASE_URL/models" | head -1             # via proxy → OK (modellendepunktet)
   curl -sI https://example.com | head -1                       # → avvist (ikke i --net)
   curl -s --max-time 5 http://host.containers.internal/ || true      # host port 80 → 502 (IP-filteret)
   curl -s --max-time 5 http://host.containers.internal:8000/ || true # modellserver → OK (auto-trusted)
@@ -718,7 +721,7 @@ mkdir -p /tmp/sbx-test
   echo x > /work/test && stat -c "%U" /work/test         # OK, i overlayen (patch etterpå)
 '
 podman logs "$(podman ps --filter name=sbx- --format '{{.Names}}' | grep -m1 proxy)" | tail
-# én JSON-linje per beslutning: api.anthropic.com:443 tillatt,
+# én JSON-linje per beslutning: modellhosten tillatt,
 # host.containers.internal:80 avvist (link-local, ikke trusted)
 
 # host:PORT: eksplisitt host-port (annen port enn modellserveren)
@@ -739,12 +742,9 @@ SBX_RUNTIME=runsc ./run-code.sh -w /tmp/sbx-test -- sh -c 'true' 2>&1 \
   | grep -F 'error: SBX_RUNTIME=runsc'                         # → match (exit 1)
 
 # Agent kjører via proxy
-./run-code.sh -w /tmp/sbx-test -- claude -p "Svar bare: OK"
-# (containernens claude kjører med bypassPermissions som default — se
-# «Container-hardening»; ingen --dangerously-skip-permissions nødvendig)
 ./run-code.sh -w /tmp/sbx-test -- pi -p "Svar bare: OK"
-# (pi bruker models.json-configurationen som sbx-init.sh avleder fra
-# modelconfigens env-vars — samme modellserver/nøkkel/modell som claude)
+# (pi bruker models.json-configurationen som sbx-init.sh skriver fra
+# SBX_MODEL_*)
 
 # -p: ekstern proxy — fail-closed hvis porten ikke svarer (ingen sesjon, ingen fallback)
 ./run-code.sh -w /tmp/sbx-test -p 127.0.0.1:9 -- sh -c 'true' 2>&1 \
