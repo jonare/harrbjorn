@@ -101,12 +101,14 @@ check    "A: acl-påtte"                "$P" "acl_file: /config/acl.yaml"
 check    "A: port"                     "$P" "port: 3128"
 check    "A: idle timeout"             "$P" "idle_timeout: 10m"
 check_absent "A: ingen action-nøkkel i proxy.yaml" "$P" "action:"
+check_absent "A: ingen alt-åpne områder" "$P" "0\.0\.0\.0/0"
 warn_check "A: advarer host:port"      "github\.com:443"
 warn_check "A: advarer skadepost"      "foo\.\.com"
 
 # ---------------------------------------------------------------- scenario B
-# open-modus: action open, tillitshost IKKE i ACL (default tillater alt),
-# men port-unntaket står likevel (IP-filteret nekter link-local ellers).
+# open-modus (@all er alt): action open, tillitshost IKKE i ACL (default
+# tillater alt), og IP-filteret slipper alle adresser — private, loopback
+# og link-local (hosten) også.
 LIST_B="$T/b.txt"
 printf 'api.github.com\n' > "$LIST_B"
 OUT_B="$T/out-b"
@@ -116,7 +118,8 @@ B="$OUT_B/acl.yaml" Q="$OUT_B/proxy.yaml"
 check        "B: open action"          "$B" "action: open"
 check_absent "B: tillitshost ikke i ACL" "$B" "host\.containers\.internal"
 check        "B: tillitshost-unntak"   "$Q" "169\.254\.1\.2:443"
-check_absent "B: ingen allow_ranges"   "$Q" "allow_ranges:"
+check        "B: alle IPv4-adresser"   "$Q" "'0\.0\.0\.0/0'"
+check        "B: alle IPv6-adresser"   "$Q" "'::/0'"
 
 # ---------------------------------------------------------------- scenario C
 # ugyldige trusted-poster avvises alle med advarsel; inget genereres.

@@ -368,12 +368,11 @@ sbx_session_caps_save() {
 
 # sbx_caps_widened OLD NEW — print what NEW (.caps lines) adds to OLD, one
 # per line: a --work mode above every recorded one (none < ro < overlay <
-# rw < rw+git), @all, host:PORT and entries not recorded. After @all a name
-# is already covered; an IP literal is not (private addresses stay closed
-# in open mode, and public ones are not told apart here).
+# rw < rw+git), @all, host:PORT and entries not recorded. After @all every
+# entry and host port is already covered (@all reaches everything).
 _sbx_work_rank() { case "$1" in none) echo 0 ;; ro) echo 1 ;; overlay) echo 2 ;; rw) echo 3 ;; rw+git) echo 4 ;; esac; }
 sbx_caps_widened() {
-  local old="$1" new="$2" line e max=-1 r
+  local old="$1" new="$2" line max=-1 r
   while IFS= read -r line; do
     [[ "$line" == "work "* ]] || continue
     r="$(_sbx_work_rank "${line#work }")"; (( r > max )) && max="$r"
@@ -384,13 +383,9 @@ sbx_caps_widened() {
     case "$line" in
       "work "*) (( $(_sbx_work_rank "${line#work }") > max )) && echo "$line" ;;
       open) echo "@all" ;;
-      "host "*) echo "host:${line#host }" ;;
-      "net "*)
-        e="${line#net }"
-        if grep -qxF open <<< "$old" && [[ ! "$e" =~ ^\[ && ! "$e" =~ ^[0-9.]+(:[0-9]+)?$ && "$e" != *:*:* ]]; then
-          continue
-        fi
-        echo "$e" ;;
+      "host "*|"net "*)
+        grep -qxF open <<< "$old" && continue   # @all reaches everything
+        if [[ "$line" == "host "* ]]; then echo "host:${line#host }"; else echo "${line#net }"; fi ;;
     esac
   done <<< "$new"
   return 0
@@ -588,11 +583,10 @@ for line in sys.stdin:
 # Semantics:
 #  - allow_missing_role: true — no mTLS in the sandbox, so role "" matches
 #    no service and the ACL's default rule applies to every client.
-#  - open mode → default action open: the ACL allows everything and
-#    Smokescreen's built-in IP filter still denies private/loopback/
-#    link-local/CGNAT/metadata/IPv6-embedded. No port restriction for
-#    domain destinations — Smokescreen's ACL has no port dimension,
-#    same as the old proxy.py open mode.
+#  - open mode (@all) → default action open, and allow_ranges 0.0.0.0/0
+#    + ::/0 lift Smokescreen's IP filter (private/loopback/link-local/
+#    CGNAT/metadata/IPv6-embedded): every address on every port, the host
+#    included. Only the proxy's own addresses stay denied.
 #  - enforce mode → default action enforce with the merged allowlist as
 #    allowed_domains.
 #  - The trusted host (model server base_url port + host ports) is a
@@ -699,6 +693,12 @@ for raw in open(merged):
             allow_ranges.append(f"{ip}/{'128' if ip.version == 6 else '32'}")
     elif host is not None:
         add_acl(host)
+
+# Open mode (@all) is all: every address, private, loopback and link-local
+# (the host) included. allow_ranges is checked before the rest of the IP
+# filter; only the proxy's own addresses stay denied.
+if open_mode == '1':
+    allow_ranges += ["0.0.0.0/0", "::/0"]
 
 # Trusted host: port-scoped exception (model server + host ports).
 for t in (x for x in trusted_csv.split(',') if x.strip()):
@@ -1249,7 +1249,7 @@ sbx_main() {
   local MODE_TAG=""
   if (( OPEN_EGRESS )); then
     MODE_TAG=", open network"
-    echo "warn: open egress (--net @all): every public destination is reachable (logged; private, loopback and link-local stay blocked)." >&2
+    echo "warn: open egress (--net @all): every destination is reachable — public, private (LAN, VPN), loopback and link-local, the host on every port included (logged)." >&2
   fi
   # -p: the port harrbjorn's proxy is published on as the external proxy's
   # upstream. Fixed (the external proxy's upstream setting is static), so
@@ -1387,9 +1387,9 @@ sbx_main() {
   # --net host:PORT: host ports the sandbox may reach (test instances on the
   # host, e.g. 8080). Each port becomes a trusted proxy upstream for
   # host.containers.internal — an explicit, per-port runtime exception.
-  # The host address is link-local, so the proxy's always-deny and
-  # DNS-rebind guards refuse it no matter what the allowlist (or open
-  # network) says: the host is only ever reachable here.
+  # The host address is link-local, so the proxy's IP filter refuses it
+  # whatever the allowlist says: without @all (which reaches everything)
+  # the host is only ever reachable here.
   local p
   for p in ${HOST_PORTS[@]+"${HOST_PORTS[@]}"}; do
     case ",$PROXY_TRUSTED," in

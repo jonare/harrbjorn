@@ -31,8 +31,8 @@
 #              unntatt @anthropic)
 #     @sti     sett fra fil (inneholder /), f.eks. @../scope; nektes inne i
 #              workdir, der agenten skriver
-#     @all     åpen utgang: alle offentlige mål (logget; private, loopback og
-#              link-local er fortsatt stengt); bare sammen med host:PORT
+#     @all     åpen utgang: alt (logget) — også private adresser (LAN, VPN),
+#              loopback, link-local og hosten; bare sammen med host:PORT
 #   En settfil har én eller flere poster per linje (#-kommentarer) og kan
 #   inkludere @navn, men ikke @all eller @sti.
 #

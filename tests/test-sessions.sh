@@ -103,8 +103,11 @@ assert_eq "utvidet: @all"                       "@all " "$(widened overlay 0 "" 
 assert_eq "utvidet: ny hostport"                "host:9443 " "$(widened overlay 0 host.containers.internal:8000 -- overlay 0 host.containers.internal:8000,host.containers.internal:9443)"
 assert_eq "utvidet: ny post"                    "b.example " "$(widened overlay 0 "" a.example -- overlay 0 "" a.example b.example)"
 assert_eq "utvidet: navn etter @all er dekket"  "" "$(widened overlay 1 "" -- overlay 0 "" github.com)"
-assert_eq "utvidet: IP-literal etter @all er ny (private stengt i åpen modus)" "10.0.0.5:8080 [fd00::1]:443 " \
+assert_eq "utvidet: IP-literal etter @all er dekket" "" \
   "$(widened overlay 1 "" -- overlay 0 "" 10.0.0.5:8080 '[fd00::1]:443')"
+assert_eq "utvidet: hostport etter @all er dekket" "" \
+  "$(widened overlay 1 "" -- overlay 0 host.containers.internal:9443)"
+assert_eq "utvidet: work etter @all er fortsatt ny" "work rw " "$(widened overlay 1 "" -- rw 0 "")"
 
 # Opprydding fjerner også caps-fila.
 mk code-700-7 700; mk code-800-8 800
