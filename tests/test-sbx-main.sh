@@ -249,6 +249,7 @@ pyaml() { cat "$PLOG.config/proxy.yaml" 2>/dev/null; }
 acl_action() { sed -n 's/^ *action: *//p' "$PLOG.config/acl.yaml" 2>/dev/null | head -1; }
 run_main true
 assert_eq       "net: håndhevet som standard"          enforce "$(acl_action)"
+assert_no_match "net: håndhevet: ingen alt-åpne områder" '0\.0\.0\.0/0|::/0' "$(pyaml)"
 assert_no_match "net: uten base-URL: ingen @anthropic" 'anthropic|claude' "$(acl)"
 assert_no_match "net: ingen dev-hoster som standard"   'github|npmjs|pypi|debian' "$(acl)"
 assert_no_match "net: ingen advarsel om åpen utgang"   'open egress' "$MAIN_ERR"
@@ -298,6 +299,9 @@ assert_match    "net: host:PORT logges"                'host ports: 9443' "$MAIN
 run_main --net @all true
 assert_eq       "net: @all gir åpen utgang"            open "$(acl_action)"
 assert_match    "net: @all varsles"                    'warn: open egress' "$MAIN_ERR"
+assert_match    "net: @all: advarselen nevner LAN og hosten" 'open egress.*private.*host' "$MAIN_ERR"
+assert_match    "net: @all: alle IPv4-adresser"        "'0\.0\.0\.0/0'" "$(pyaml)"
+assert_match    "net: @all: alle IPv6-adresser"        "'::/0'" "$(pyaml)"
 assert_no_match "net: @all: ingen allowed_domains"     'allowed_domains' "$(acl)"
 run_main --net @all,host:9443 true
 assert_eq       "net: @all + host:PORT: åpen"          open "$(acl_action)"

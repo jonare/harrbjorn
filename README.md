@@ -42,7 +42,8 @@ podman/pasta/netavark og krun/libkrun; den eksterne proxyen med `-p`.
   relayen og den eksterne proxyen, som har harrbjorns proxy som upstream),
   allowlisten håndheves (også med `-p`; åpen kun med `--net @all`), og
   private, loopback-, link-local- og CGNAT-adresser avvises med mindre en
-  IP-literal i allowlisten eller trusted-settet slipper dem. Uten `--net` er
+  IP-literal i allowlisten eller trusted-settet slipper dem — eller
+  `--net @all`, som åpner alt, også LAN, VPN og hosten. Uten `--net` er
   bare modellendepunktet åpent. Hostens tjenester nås bare via
   trusted-portene (modellport, `--net host:PORT`).
 - **Filsystem:** agenten skriver bare i `/work` (som standard en overlay:
@@ -211,17 +212,18 @@ komponent (Smokescreen), og proxyen er ett punkt for utgangspolicyen (med
    vei ut (se [Ekstern proxy](#ekstern-proxy--p)).
 2. **Proxy-utgang** — eneste utgang; allowlisten fra `--net` (pluss
    modellendepunktet) håndheves. Åpen utgang er `--net @all`, aldri en
-   env-innstilling. Åpen modus: IP-filteret (loopback, link-local,
-   private, CGNAT) og DNS-rebinding-vernet gjelder fortsatt, og alle
-   beslutninger logges.
+   env-innstilling. Åpen modus er alt: IP-filteret (loopback, link-local,
+   private, CGNAT) løftes, så LAN, VPN og hosten på alle porter er nåbare;
+   alle beslutninger logges fortsatt.
    CONNECT-tunnel for HTTPS (ingen MITM); hver beslutning (tillatt/avvist,
    med grunn) logges som JSON og lagres i `.sandbox/logs/<sesjon>.jsonl`.
 3. **Hosten er link-local** — `host.containers.internal` (169.254.1.2)
    avvises av IP-filteret, både som navn og som IP-literal i allowlisten.
    Hostens tjenester nås via trusted-settet (modellport + `host:PORT`), se
-   [Host-tjenester](#host-tjenester). Unntak: hostens LAN- eller offentlige
-   adresse som IP-literal, og med `-p` det den eksterne proxyen når uten å
-   gå via harrbjorns proxy (upstream-regler som ikke dekker alt).
+   [Host-tjenester](#host-tjenester). Unntak: `--net @all` (alt, også
+   hosten), hostens LAN- eller offentlige adresse som IP-literal, og med
+   `-p` det den eksterne proxyen når uten å gå via harrbjorns proxy
+   (upstream-regler som ikke dekker alt).
 4. **Container-hardening** — `--read-only`, `--cap-drop ALL`,
    `--security-opt no-new-privileges`, keep-id user-namespace (hostbrukeren
    blir uid 1000 i containeren, så bindmounter eies av hostbrukeren utenfor),
@@ -405,7 +407,7 @@ kommaseparert), aldri via env/`.env`:
 | `host:PORT` | hosttjeneste på `host.containers.internal:PORT`, se [Host-tjenester](#host-tjenester) |
 | `@navn` | sett: `~/.config/harrbjorn/net/<navn>`, ellers `net/<navn>` i repoet |
 | `@sti/til/fil` | sett fra fil (posten inneholder `/`; relativ til gjeldende katalog) |
-| `@all` | åpen utgang: alle offentlige mål (IP-filteret og loggingen gjelder fortsatt); kan bare kombineres med `host:PORT` |
+| `@all` | åpen utgang: alt — offentlige og private adresser (LAN, VPN), loopback og link-local, også hosten på alle porter. Bare loggingen gjelder. Kan bare kombineres med `host:PORT` |
 
 Settene i `net/`:
 
@@ -434,13 +436,14 @@ Postene slås sammen til en per-sesjon-allowlist
 IP-filter og DNS-rebinding-vern (Smokescreen): proxyen resolver navnet selv
 og kobler til den resolverte adressen, så et navn kan ikke peke om mellom
 sjekk og kobling. Loopback, link-local, private (10/8, 172.16/12,
-192.168/16, fc00::/7), CGNAT (100.64/10) og uspesifiserte adresser avvises —
-i begge moduser — med mindre en IP-literal i allowlisten (eller
-trusted-settet) slipper akkurat den adressen (og porten) gjennom. Det
-innebærer at `host.containers.internal` (169.254.1.2, link-local) aldri
-slippes gjennom av allowlisten — verken som navn eller IP-literal (den
-hoppes over med advarsel) — host-tjenester kun via trusted-settet
-(nedenfor).
+192.168/16, fc00::/7), CGNAT (100.64/10) og uspesifiserte adresser avvises
+med mindre en IP-literal i allowlisten (eller trusted-settet) slipper akkurat
+den adressen (og porten) gjennom. Det innebærer at
+`host.containers.internal` (169.254.1.2, link-local) aldri slippes gjennom
+av allowlisten — verken som navn eller IP-literal (den hoppes over med
+advarsel) — host-tjenester kun via trusted-settet (nedenfor). Med
+`--net @all` løftes filteret helt (`allow_ranges` `0.0.0.0/0` og `::/0`):
+alt er nåbart, også hosten.
 
 ## Host-tjenester
 
@@ -455,8 +458,8 @@ hostadresse, 169.254.1.2) og kun via proxyens **trusted-sett**:
    Hver port blir en trusted upstream for `host.containers.internal:<port>` —
    et eksplisitt, port-for-port-runtime-unntak, aldri en allowlistpost.
    Hosten er link-local, så IP-filteret og DNS-rebinding-vernet avslår den
-   uansett hva allowlisten (eller open-modus) sier: `host:PORT` er veien til
-   host-tjenester, i begge moduser (se [Trusselmodell](#trusselmodell) om
+   uansett hva allowlisten sier: `host:PORT` er veien til host-tjenester
+   (`--net @all` når hosten uansett; se [Trusselmodell](#trusselmodell) om
    hostens andre adresser).
 
 Merk: tjenester på hosten må lytte på et grensesnitt utover loopback
@@ -573,8 +576,8 @@ harrbjorn code --resume=code-1795694761-1318814 pi -r
   `--resume` HOME-en mer enn det, f.eks. en HOME fra `--net @all`
   gjenopptatt med `--work rw`, advarer wrapperen før noe startes og
   lister utvidelsene (`work rw`, `@all`, `host:PORT`, nye poster). Etter
-  `@all` regnes navn som dekket, IP-literaler ikke (private adresser er
-  stengt også i åpen modus). Økter fra før dette ble lagret, gir en egen
+  `@all` regnes alle poster og hostporter som dekket (`@all` når alt).
+  Økter fra før dette ble lagret, gir en egen
   advarsel ved første resume.
 - Workdir (`/work`) er ikke en del av økta: med `--work rw` ser også neste
   nye økt endringer der (f.eks. prosjektets `.claude/settings.json` eller
@@ -802,10 +805,10 @@ mkdir -p /tmp/sbx-a
   Burps upstream), unntatt trafikken til modellporten og hostportene,
   som går direkte gjennom relayen. Audit-loggen
   registrerer beslutninger (mål, tillatt/avvist, grunn), ikke innhold.
-- Åpen utgang (`--net @all`) er et bevisst valg per økt: alle beslutninger
-  logges fortsatt, og IP-filteret (loopback, link-local, private, CGNAT),
-  DNS-rebinding-vernet og container-hardening holder likevel. Det er ikke
-  exfil-vern — det er heller ikke settene.
+- Åpen utgang (`--net @all`) er et bevisst valg per økt, og det er alt:
+  LAN, VPN, hosten på alle porter og (på sky-VM-er) metadata-tjenesten er
+  nåbare. Alle beslutninger logges fortsatt, og container-hardening holder.
+  Det er ikke exfil-vern — det er heller ikke settene.
 - Proxy-utgang betyr at **HTTP-vedkommende verktøy** i pentest-sandboxen er
   de som når målene: curl, python, git m.fl. bruker
   `HTTP(S)_PROXY`-env-vars automatisk. **sqlmap** må få proxyen eksplisitt:
