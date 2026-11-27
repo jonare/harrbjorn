@@ -93,7 +93,7 @@ SBX_SESSION_NET_RE='^sbx-[a-z]+-[0-9]+-[0-9]+-int$'
 # Reclaim resources from aborted runs: dead session containers and unused
 # session networks. Running containers belong to live sessions — untouched
 # (so a proxy/relay left running by a wrapper killed with SIGKILL stays until
-# removed by hand; see README «Fjerne»).
+# removed by hand; see README «Removal»).
 # A dead proxy's audit log is saved first (the EXIT trap that normally saves
 # it never ran), unless that session's log already exists.
 sbx_reap_orphans() {
@@ -437,7 +437,7 @@ for link in data:
 # capability. Without it only the model endpoint is open (added in sbx_main
 # from the model config). Items:
 #   host, *.domain, IP, IP:port, [IPv6]:port — allowlist entries (format:
-#     README «Nett»; validated by sbx_write_proxy_policy)
+#     README «Network»; validated by sbx_write_proxy_policy)
 #   host:PORT — a host port, reached via host.containers.internal
 #   @name     — a set: ~/.config/harrbjorn/net/<name>, else net/<name> here
 #   @path     — a set from a file (the item contains '/')
@@ -596,7 +596,7 @@ for line in sys.stdin:
 #    all ports. In enforce mode the hostname also goes into
 #    allowed_domains so the ACL accepts it.
 #
-# Allowlist entries (--net, README «Nett»): host, *.wildcard,
+# Allowlist entries (--net, README «Network»): host, *.wildcard,
 # IP, IP:port, [IPv6]:port. Two semantic differences from proxy.py:
 #  - hostname:port loses its port scoping (the ACL has no port dimension;
 #    the entry grants the host on all ports, subject to the IP filter);
